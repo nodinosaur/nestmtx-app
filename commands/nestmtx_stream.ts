@@ -320,15 +320,21 @@ export default class NestmtxStream extends BaseCommand {
       '-loglevel',
       env.get('FFMPEG_DEBUG_LEVEL', 'warning'),
       '-fflags',
-      '+discardcorrupt+genpts', // Ignore corrupted frames, regenerate PTS on discontinuity
+      '+discardcorrupt+genpts',
       '-avoid_negative_ts',
       'make_zero',
 
       '-i',
       `pipe:3`,
 
-      // Hardware-accelerated encoding arguments (codec + device + vf filter)
-      ...this.#hardwareAcceleratedEncodingArguments,
+      '-c:v',
+      'libx264',
+      '-preset',
+      'veryfast',
+      '-tune',
+      'zerolatency',
+      '-vf',
+      'fps=15',
       '-b:v',
       '2M',
       '-maxrate',
@@ -338,27 +344,24 @@ export default class NestmtxStream extends BaseCommand {
       '-c:a:0',
       'aac',
       '-b:a:0',
-      '128k', // Audio bitrate for AAC
+      '128k',
 
       // Opus Audio Stream (track 2)
       '-c:a:1',
       'libopus',
       '-b:a:1',
-      '128k', // Audio bitrate for Opus
+      '128k',
 
-      // Explicit Mapping of Video and Audio Streams
       '-map',
-      '0:v:0', // Map the first video track (H.264)
+      '0:v:0',
       '-map',
-      '0:a:0', // Map the first audio track (AAC)
+      '0:a:0',
       '-map',
-      '0:a:1', // Map the second audio track (Opus)
+      '0:a:1',
 
-      // Output Format
       '-f',
       'mpegts',
 
-      // Destination (SRT or other media server)
       `"${this.#destination}"`,
     ]
 
