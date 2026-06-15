@@ -13,6 +13,9 @@ RUN echo "http://dl-cdn.alpinelinux.org/alpine/edge/main" >> /etc/apk/repositori
     apk --no-cache add dumb-init \
     openssl \
     ffmpeg \
+    intel-media-driver \
+    libva-intel-driver \
+    libva-utils \
     gstreamer-tools \
     gst-plugins-base \
     gst-plugins-good \

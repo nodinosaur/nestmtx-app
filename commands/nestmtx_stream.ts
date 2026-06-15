@@ -329,13 +329,6 @@ export default class NestmtxStream extends BaseCommand {
 
       // Hardware-accelerated encoding arguments (codec + device + vf filter)
       ...this.#hardwareAcceleratedEncodingArguments,
-
-      '-r',
-      '15',
-      '-profile:v',
-      'baseline',
-      '-g',
-      '15',
       '-b:v',
       '2M',
       '-maxrate',
@@ -458,7 +451,7 @@ export default class NestmtxStream extends BaseCommand {
       '-loop',
       '1',
       // Hardware-accelerated decoding arguments
-      ...this.#hardwareAcceleratedDecodingArguments,
+      //...this.#hardwareAcceleratedDecodingArguments,
       '-i',
       `${src}`,
       '-f',
@@ -466,7 +459,7 @@ export default class NestmtxStream extends BaseCommand {
       '-i',
       'anullsrc=r=48000:cl=stereo', // Synthetic audio source
       // Hardware-accelerated encoding arguments (no conflict now)
-      ...this.#hardwareAcceleratedEncodingArguments,
+      //...this.#hardwareAcceleratedEncodingArguments,
       '-c:v',
       'libx264',
       '-preset',
