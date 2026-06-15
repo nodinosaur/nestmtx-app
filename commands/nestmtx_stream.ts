@@ -333,7 +333,7 @@ export default class NestmtxStream extends BaseCommand {
       '-r',
       '15',
       '-profile:v',
-      'constrained_baseline',
+      'baseline',
       '-g',
       '15',
       '-b:v',

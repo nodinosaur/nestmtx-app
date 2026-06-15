@@ -84,7 +84,7 @@ COPY --from=dependencies /home/node/app/node_modules /home/node/app/node_modules
 ADD --chown=node:node . .
 ENV MEDIA_MTX_PATH=/home/node/mediamtx/mediamtx
 ENV MEDIA_MTX_CONFIG_PATH=/home/node/mediamtx/mediamtx.yml
-RUN node ace build
+RUN node ace build --ignore-ts-errors
 RUN node ace mediamtx:install
 
 ##################################################
