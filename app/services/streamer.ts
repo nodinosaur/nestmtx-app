@@ -32,6 +32,8 @@ interface ReadEventPayload extends DemandEventPayload {
 /**
  * A class for managing the MediaMTX service process
  */
+const ZERO_READER_TEARDOWN_MS = 30_000
+
 export class StreamerService {
   readonly #app: ApplicationService
   readonly #managedProcesses: Set<string>
@@ -169,14 +171,24 @@ export class StreamerService {
       }
       this.#lastDataCounts.set(path.path, path.dataRx)
     })
+  }
 
-    // Zero-reader teardown: mediamtx fires runOnUnDemand once per demand cycle.
-    // After a publisher swap (VAAPI restart), the demand cycle ends mid-restart
-    // when the #onUnDemand 8s recheck skips teardown. If nobody reconnects after
-    // that, mediamtx will never fire runOnUnDemand again — the path sits with a
-    // healthy publisher and zero readers indefinitely. Poll here to catch that
-    // state and clean up.
-    const ZERO_READER_TEARDOWN_MS = 30_000
+  // Zero-reader teardown: mediamtx fires runOnUnDemand once per demand cycle.
+  // After a publisher swap (VAAPI restart), the demand cycle ends mid-restart
+  // when the #onUnDemand 8s recheck skips teardown. If nobody reconnects after
+  // that, mediamtx will never fire runOnUnDemand again — the path sits with a
+  // healthy publisher and zero readers indefinitely. Poll here to catch that
+  // state and clean up.
+  //
+  // This method runs on a separate, faster schedule (every 5s) so that a reader
+  // reconnecting mid-countdown is detected within a 5-second window rather than
+  // a 30-second one. Without the faster poll, a reader that connected and
+  // disconnected inside one 30s stall-detection interval would be invisible to
+  // the reset check, and the teardown would fire on the original schedule even
+  // though a viewer was genuinely watching during most of that window.
+  async zeroReaderCronjob() {
+    const paths = this.#app.mediamtx.getPaths()
+    const livePaths = paths.filter((path) => path.ready)
     const now = Date.now()
     const livePathNames = new Set(livePaths.map((p) => p.path))
     for (const key of this.#zeroReaderSince.keys()) {
@@ -207,7 +219,9 @@ export class StreamerService {
         }
       } else {
         if (this.#zeroReaderSince.has(path.path)) {
-          this.#logger.info(`"${path.path}" has readers again — cancelling teardown timer`)
+          this.#logger.info(
+            `"${path.path}" zero-reader timer reset — reader reconnected (${path.consumers} reader(s) now active)`
+          )
           this.#zeroReaderSince.delete(path.path)
         }
       }

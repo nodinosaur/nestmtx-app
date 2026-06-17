@@ -85,6 +85,22 @@ export default class NestmtxStream extends BaseCommand {
   #videoReceiver?: RTCRtpReceiver
   #videoSsrc?: number
 
+  // Camera stream format detected from output streamer stderr during the live camera
+  // phase. Populated after the first in-place restart (when the new output streamer
+  // logs the input stream info at info level). Used in subsequent cycles to pre-encode
+  // the placeholder at the camera's exact resolution and H264 profile so the VAAPI
+  // hardware decoder's filter chain never sees an SPS change.
+  #detectedCameraSize?: string    // e.g. "1152x864"
+  #detectedCameraProfile?: string // e.g. "High", "Main"
+  #singleProcessCameraActive: boolean = false
+  // Guards against overwriting a correct detection with a wrong one. ffmpeg logs two
+  // "Video: h264 (...)" lines per session: the input-side description (camera's real
+  // profile, e.g. Main) and the encoder's output-side description (~30ms later, always
+  // High because h264_vaapi chose High for its own output). Both lines match the
+  // detection regex, so without this flag the correct profile gets overwritten.
+  // Cleared when the camera phase starts; set on the first successful match.
+  #detectedCameraForCurrentCycle: boolean = false
+
   get #outputStreamLogger() {
     return logger.child({ stream: 'output' })
   }
@@ -379,9 +395,18 @@ export default class NestmtxStream extends BaseCommand {
     const ffmpegBinary = env.get('FFMPEG_BIN', 'ffmpeg')
     const accelDevice = env.get('FFMPEG_HW_ACCELERATOR_DEVICE', '/dev/dri/renderD128')
 
+    // In single-process mode we need ffmpeg to emit stream-info lines so we can
+    // detect the camera's resolution and H264 profile. Those lines are logged at
+    // ffmpeg's "info" level — they are suppressed by the default "warning" level.
+    // Boost to "info" only for this path; the extra verbosity is acceptable for
+    // an experimental mode and the detection logic filters what it cares about.
+    const logLevel = (useVaapi && this.#singleProcessMode)
+      ? 'info'
+      : env.get('FFMPEG_DEBUG_LEVEL', 'warning')
+
     const ffmpegArgs: string[] = [
       '-loglevel',
-      env.get('FFMPEG_DEBUG_LEVEL', 'warning'),
+      logLevel,
       '-fflags',
       '+discardcorrupt+genpts',
       '-avoid_negative_ts',
@@ -395,24 +420,11 @@ export default class NestmtxStream extends BaseCommand {
       ffmpegArgs.push(
         '-init_hw_device', `vaapi=va:${accelDevice}`,
         '-filter_hw_device', 'va',
+        '-hwaccel', 'vaapi',
+        '-hwaccel_output_format', 'vaapi',
+        '-hwaccel_device', 'va',
+        '-extra_hw_frames', '64',
       )
-      if (!this.#singleProcessMode) {
-        // Restart-based mode: process is created fresh for each source phase, so the
-        // decoder never sees a format change mid-stream. Hardware decode is safe here
-        // and keeps decoded frames in VAAPI surface memory for zero CPU round-trip.
-        ffmpegArgs.push(
-          '-hwaccel', 'vaapi',
-          '-hwaccel_output_format', 'vaapi',
-          '-hwaccel_device', 'va',
-          '-extra_hw_frames', '64',
-        )
-      }
-      // Single-process mode omits -hwaccel intentionally: the VAAPI hardware decoder
-      // does not support filter-chain reinitialization when the source changes resolution
-      // or profile mid-stream ("Error reinitializing filters, Function not implemented").
-      // Software decode handles SPS changes between the placeholder and live camera
-      // without error; the CPU cost of software decode is acceptable since hardware
-      // encode (h264_vaapi) still offloads the expensive part.
     }
 
     // Applied regardless of encoder: on severely corrupted/lossy RTP input the
@@ -426,38 +438,19 @@ export default class NestmtxStream extends BaseCommand {
     ffmpegArgs.push('-i', 'pipe:3')
 
     if (useVaapi) {
-      if (this.#singleProcessMode) {
-        // Software decode → software scale to a fixed 1920×1080 → NV12 → hwupload → VAAPI encode.
-        // scale and format are software filters: they reinitialize gracefully when the
-        // input changes resolution or pixel format (placeholder → live camera switch).
-        // hwupload uploads the CPU NV12 frame into VAAPI surface memory for h264_vaapi.
-        // Fixed 1920×1080 output keeps the SRT stream's declared resolution constant
-        // regardless of what resolution the Nest camera happens to be streaming at.
-        ffmpegArgs.push(
-          '-vf',
-          'scale=1920:1080:flags=lanczos,format=nv12,hwupload=extra_hw_frames=64',
-          '-c:v',
-          'h264_vaapi',
-          '-b:v',
-          '2M',
-          '-maxrate',
-          '2M',
-        )
-      } else {
-        // scale_vaapi keeps the frame on the GPU and ensures NV12 format, which
-        // h264_vaapi requires. Replaces format=nv12,hwupload which would download
-        // to CPU then re-upload — that was what caused the swscaler warning.
-        ffmpegArgs.push(
-          '-vf',
-          'scale_vaapi=format=nv12',
-          '-c:v',
-          'h264_vaapi',
-          '-b:v',
-          '2M',
-          '-maxrate',
-          '2M',
-        )
-      }
+      // scale_vaapi keeps the frame on the GPU and ensures NV12 format, which
+      // h264_vaapi requires. Replaces format=nv12,hwupload which would download
+      // to CPU then re-upload — that was what caused the swscaler warning.
+      ffmpegArgs.push(
+        '-vf',
+        'scale_vaapi=format=nv12',
+        '-c:v',
+        'h264_vaapi',
+        '-b:v',
+        '2M',
+        '-maxrate',
+        '2M',
+      )
     } else {
       ffmpegArgs.push(
         '-c:v',
@@ -541,6 +534,29 @@ export default class NestmtxStream extends BaseCommand {
           if (this.#singleProcessMode && line.includes('Error reinitializing filters')) {
             this.#singleProcessReinitActive = true
           }
+          // During the live camera phase, parse the stream info line that ffmpeg emits
+          // when it first processes the input (requires loglevel=info, set above for
+          // single-process mode). Format: "Stream #0:0: Video: h264 (High), yuv420p..., 1152x864"
+          // Stored values are applied to the next placeholder cycle so the VAAPI decoder
+          // never sees an SPS resolution or profile change.
+          //
+          // Regex uses .*? (lazy) after the profile so it tolerates optional codec-tag
+          // fields like " (avc1 / 0x31637661)" that appear between the profile and the
+          // pixel format in some container/encoder combinations. \d{3,4}x\d{3,4} matches
+          // standard video resolutions (640×480 through 1920×1080) while avoiding false
+          // matches on hex codec tags (single leading digit before 'x') or SAR/DAR ratios
+          // (which use ':' not 'x').
+          if (this.#singleProcessMode && this.#singleProcessCameraActive && !this.#detectedCameraForCurrentCycle) {
+            const m = line.match(/Video: h264 \(([^)]+)\).*?(\d{3,4}x\d{3,4})/)
+            if (m) {
+              this.#detectedCameraProfile = m[1]
+              this.#detectedCameraSize = m[2]
+              this.#detectedCameraForCurrentCycle = true
+              this.#outputStreamLogger.info(
+                `single-process mode: stored camera format — size=${this.#detectedCameraSize} profile=${this.#detectedCameraProfile} (from line: ${line.substring(0, 120)})`
+              )
+            }
+          }
         })
     })
     // Node.js backs stdio[3] with a net.Socket internally. When the process is
@@ -568,11 +584,11 @@ export default class NestmtxStream extends BaseCommand {
         if (this.#singleProcessReinitCount >= 3) {
           this.#singleProcessFailed = true
           logger.warning(
-            `single-process mode: ${this.#singleProcessReinitCount} consecutive reinit failures — disabling for this session, subsequent cycles will use restart-based mode`
+            `single-process mode: ${this.#singleProcessReinitCount} consecutive reinit failures — disabling for this session, subsequent cycles will use restart-based mode (detectedSize=${this.#detectedCameraSize ?? 'none'} detectedProfile=${this.#detectedCameraProfile ?? 'none'})`
           )
         } else {
           logger.warning(
-            `single-process mode: reinit failure #${this.#singleProcessReinitCount}, restarting output streamer in-place`
+            `single-process mode: reinit failure #${this.#singleProcessReinitCount} — restarting output streamer in-place (detectedSize=${this.#detectedCameraSize ?? 'none'} detectedProfile=${this.#detectedCameraProfile ?? 'none'})`
           )
         }
         // Restart with write-gating so camera data doesn't stream into a half-dead pipe.
@@ -729,7 +745,7 @@ export default class NestmtxStream extends BaseCommand {
       })
   }
 
-  #streamJpegToOutputStream(src: string, size: string = '640x480', signal?: AbortSignal) {
+  #streamJpegToOutputStream(src: string, size: string = '640x480', signal?: AbortSignal, profile?: string) {
     const ffmpegBinary = env.get('FFMPEG_BIN', 'ffmpeg')
     const ffmpegArgs = [
       '-loglevel',
@@ -751,7 +767,12 @@ export default class NestmtxStream extends BaseCommand {
       '-preset',
       'ultrafast', // Ultrafast preset for low CPU on static placeholder
       '-profile:v',
-      'baseline', // baseline required with ultrafast preset
+      // When a detected profile is passed (single-process mode, 2nd+ cycle), match
+      // the camera's profile so the VAAPI decoder's SPS doesn't change. e.g. "High"
+      // → "high", "Constrained Baseline" → "constrained_baseline". Falls back to
+      // "baseline" for the first cycle (before any format is detected) or in
+      // restart-based mode where profile matching is not needed.
+      profile ? profile.toLowerCase().replace(/ /g, '_') : 'baseline',
       '-tune',
       'zerolatency',
       '-r',
@@ -1010,11 +1031,32 @@ export default class NestmtxStream extends BaseCommand {
       throw new Error('Failed to get ICE servers')
     }
 
+    // Diagnostic: dump format-matching state at session start so every subsequent
+    // log entry can be cross-referenced against what was known at this point.
+    this.#cameraStreamLogger.info(
+      `webrtcStart: singleProcessMode=${this.#singleProcessMode} singleProcessFailed=${this.#singleProcessFailed} detectedSize=${this.#detectedCameraSize ?? 'none'} detectedProfile=${this.#detectedCameraProfile ?? 'none'}`
+    )
+
     this.#connectingStreamAbortController = new AbortController()
+    // In single-process mode, use the camera's detected resolution and H264 profile
+    // so the VAAPI hardware decoder's filter chain never sees an SPS change when
+    // camera data takes over. First cycle has no detection yet → default 1920x1080
+    // baseline, which will trigger a reinit error and 55ms in-place recovery. Second
+    // cycle onwards: placeholder matches camera → no reinit error.
+    const placeholderSize = (this.#singleProcessMode && this.#detectedCameraSize)
+      ? this.#detectedCameraSize
+      : '1920x1080'
+    const placeholderProfile = (this.#singleProcessMode && this.#detectedCameraProfile)
+      ? this.#detectedCameraProfile
+      : undefined
+    this.#cameraStreamLogger.info(
+      `webrtcStart: starting placeholder — size=${placeholderSize}${placeholderProfile ? ` profile=${placeholderProfile}` : ' profile=baseline(default)'} (reason: ${this.#singleProcessMode && this.#detectedCameraSize ? 'matched detected camera format' : this.#singleProcessMode ? 'single-process mode but no detection yet' : 'restart-based mode or mode disabled'})`
+    )
     this.#streamJpegToOutputStream(
       this.#connectingFilePath,
-      '1920x1080',
-      this.#connectingStreamAbortController.signal
+      placeholderSize,
+      this.#connectingStreamAbortController.signal,
+      placeholderProfile,
     )
 
     const getPortOptions: PickPortOptions = {
@@ -1269,6 +1311,10 @@ a=rtcp:${audioRTCPPort}
 
     await writeFile(this.#streamerFFMpegInputSdp, sdp)
     this.#connectingStreamAbortController.abort()
+    if (this.#singleProcessMode) {
+      this.#singleProcessCameraActive = true
+      this.#detectedCameraForCurrentCycle = false
+    }
     this.#cameraStreamLogger.info(`Starting FFMpeg with WebRTC stream`)
 
     const ffmpegArgs: string[] = [
@@ -1367,13 +1413,44 @@ a=rtcp:${audioRTCPPort}
     )
     this.#cameraStreamer.on('exit', async (code, es?: NodeJS.Signals) => {
       this.#cameraStreamLogger.info(`WebRTC Camera FFMpeg exited with code ${code}`)
-      if (code !== 0 && code !== 8 && es !== 'SIGABRT') {
+      const isUnexpected = code !== 0 && code !== 8 && es !== 'SIGABRT'
+      if (isUnexpected && this.#singleProcessMode) {
+        // Unexpected crash in single-process mode — recover in-place rather than
+        // tearing down the whole process. A camera crash (bitstream corruption,
+        // exit code 183, etc.) leaves the VAAPI output streamer frozen: it's still
+        // running but blocking on pipe:3 with no writer. The recovery is identical
+        // to reinit-failure recovery — kill and respawn the frozen output streamer,
+        // then re-enter the placeholder→camera cycle. Camera crashes count toward
+        // the same failure budget as reinit errors; after 3 total, single-process
+        // mode is disabled for the session.
+        this.#singleProcessReinitCount++
+        this.#cameraStreamLogger.warning(
+          `single-process mode: camera crashed unexpectedly (code=${code}) — recovering in-place, failure #${this.#singleProcessReinitCount} (detectedSize=${this.#detectedCameraSize ?? 'none'} detectedProfile=${this.#detectedCameraProfile ?? 'none'})`
+        )
+        if (this.#singleProcessReinitCount >= 3) {
+          this.#singleProcessFailed = true
+          this.#cameraStreamLogger.warning(
+            `single-process mode: ${this.#singleProcessReinitCount} consecutive failures — disabling for this session, subsequent cycles will use restart-based mode`
+          )
+        }
+        this.#singleProcessCameraActive = false
+        // Restart the output streamer to unfreeze it. #singleProcessMode now
+        // returns false if #singleProcessFailed was just set above, so this
+        // automatically falls back to software encoding on the 3rd failure.
+        await this.#restartOutputStreamer(this.#singleProcessMode)
+        this.#cameraStreamLogger.info(
+          `single-process mode: output streamer restarted (pid=${this.#streamer?.pid}) after camera crash`
+        )
+        void this.#webrtcStart(service, camera)
+      } else if (isUnexpected) {
+        // Unexpected exit in restart-based mode — full teardown, PM3 will restart.
         const res = this.#streamer ? await this.#streamer : undefined
         if (res) {
           this.#cameraStreamLogger.info(res.escapedCommand)
         }
         this.#gracefulExit(code || 0)
       } else {
+        // Expected exit (code 0, 8, or SIGABRT from a deliberate kill).
         if (!this.#singleProcessMode) {
           // Restart-based mode: restart back to software before starting a new
           // placeholder phase (the next #webrtcStart call starts a new static input
@@ -1384,6 +1461,7 @@ a=rtcp:${audioRTCPPort}
           // The new static input will be fed as H264 to the same running VAAPI
           // output streamer; the VAAPI decoder sees another SPS transition (live
           // camera → placeholder H264) which is also part of what we're testing.
+          this.#singleProcessCameraActive = false
           this.#cameraStreamLogger.info(
             `single-process mode: camera exited, output streamer pid=${this.#streamer?.pid} stays running`
           )
