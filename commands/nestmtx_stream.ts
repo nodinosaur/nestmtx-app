@@ -23,7 +23,7 @@ import type { CommandOptions } from '@adonisjs/core/types/ace'
 import type { ExecaChildProcess } from 'execa'
 import type { smartdevicemanagement_v1 } from 'googleapis'
 import type { Socket as StreamPrivateApiClient } from 'socket.io-client'
-import type { RTCIceServer, RTCTrackEvent } from 'werift'
+import type { RTCIceServer, RTCTrackEvent, RTCRtpReceiver } from 'werift'
 import type { PickPortOptions } from '#utilities/ports'
 import type { Socket as DGramSocket } from 'node:dgram'
 import type { Server as UnixSocketServer, Socket as UnixSocket } from 'node:net'
@@ -68,9 +68,22 @@ export default class NestmtxStream extends BaseCommand {
   #packetsToOutputInterval?: NodeJS.Timeout
   #lastThirtyPacketCounts: number[] = []
   #stalled: boolean = false
+  #outputStreamerIsRestarting: boolean = false
   #firstUnderflowWarningAt?: DateTime
   #lastUnderflowWarningAt?: DateTime
   #clearUnderflowWarningInterval?: NodeJS.Timeout
+
+  // Single-process mode state: track reinit failures so we can recover in-place
+  // rather than crashing the whole process, and disable the mode after repeated failures.
+  #singleProcessReinitCount: number = 0
+  #singleProcessFailed: boolean = false
+  #singleProcessReinitActive: boolean = false
+
+  // Stored across #webrtcStart calls so the output-streamer exit handler can send
+  // a PLI after an in-place restart (videoReceiver is a local in #webrtcStart and
+  // therefore out of scope from the exit handler closure).
+  #videoReceiver?: RTCRtpReceiver
+  #videoSsrc?: number
 
   get #outputStreamLogger() {
     return logger.child({ stream: 'output' })
@@ -126,6 +139,35 @@ export default class NestmtxStream extends BaseCommand {
     )
   }
 
+  get #isVaapiEnabled() {
+    return env.get('FFMPEG_HW_ACCELERATOR', '').toLowerCase() === 'vaapi'
+  }
+
+  // Experimental single-process investigation mode. When VAAPI_SINGLE_PROCESS=true
+  // (and FFMPEG_HW_ACCELERATOR=vaapi is also set), the output streamer starts in
+  // VAAPI mode from the very beginning of a camera session and is never restarted
+  // on placeholder↔live source switches. This tests whether the VAAPI hardware
+  // decoder can handle the SPS change that occurs when the static placeholder stream
+  // is replaced by the live camera stream, without a filter chain reinitialization.
+  //
+  // If the decoder survives the transition, the entire restart-based architecture
+  // (Rounds 2–14) becomes unnecessary: a single continuous output process and SRT
+  // connection can serve both the placeholder and live phases, eliminating the
+  // viewer session drop that has been accepted as architectural since Round 14.
+  //
+  // If "Error reinitializing filters, Function not implemented" appears in the
+  // output streamer log after the source switches, then the SPS parameters differ
+  // and placeholder pre-conversion (matching the camera's exact profile/level) is
+  // the next step. Set FFMPEG_DEBUG_LEVEL=info in the same test run to see the
+  // actual stream parameters the output streamer detects for each source.
+  get #singleProcessMode() {
+    return (
+      !this.#singleProcessFailed &&
+      String(env.get('VAAPI_SINGLE_PROCESS', 'false')) === 'true' &&
+      this.#isVaapiEnabled
+    )
+  }
+
   async run() {
     process.once('SIGINT', this.#gracefulExit.bind(this))
     logger.info(`NestMTX Streamer for "${this.path}". PID: ${process.pid}`)
@@ -162,7 +204,12 @@ export default class NestmtxStream extends BaseCommand {
       logger.error(`Error from Camera Unix Socket: ${error.message}`)
     })
     logger.info(`Starting output streamer`)
-    this.#startOutputStreamer()
+    if (this.#singleProcessMode) {
+      logger.info(`VAAPI_SINGLE_PROCESS mode: enabled — starting output streamer in VAAPI mode from the beginning`)
+    } else {
+      logger.info(`VAAPI_SINGLE_PROCESS mode: disabled — using restart-based VAAPI switch`)
+    }
+    this.#startOutputStreamer(this.#singleProcessMode)
     const privateApiServerUrl = `http://127.0.0.1:${this.port}`
     logger.info(`Searching for Private API Server`)
     await new Promise<void>((resolve) => {
@@ -275,71 +322,160 @@ export default class NestmtxStream extends BaseCommand {
   }
 
   #onStreamerUnixSocketConnection(socket: UnixSocket) {
+    logger.info(`streamer.sock: client connected`)
+    let firstWrite = true
     socket.on('data', (raw) => {
       const valid = this.#validateRtpPacket(raw)
       if (!valid) {
         return
       }
-      // console.log(raw)
-      // writeFileSync(this.#streamerPassthroughFifo, raw)
-      if (this.#streamer) {
+      if (this.#streamer && !this.#outputStreamerIsRestarting) {
+        if (firstWrite) {
+          firstWrite = false
+          this.#outputStreamLogger.info(`First data from static input reaching pipe:3`)
+        }
         this.#packetsToOutputCount += 1
         this.#stalled = false
         // @ts-expect-error - this is correct
         this.#streamer.stdio[3].write(raw)
       }
     })
+    socket.on('end', () => logger.info(`streamer.sock: client disconnected (end)`))
+    socket.on('close', () => logger.info(`streamer.sock: client disconnected (close)`))
     socket.on('error', (error) => {
-      logger.error(error)
+      logger.error(`streamer.sock client error: ${error.message}`)
     })
   }
 
   #onCameraUnixSocketConnection(socket: UnixSocket) {
+    logger.info(`camera.sock: client connected`)
+    let firstWrite = true
     socket.on('data', (raw) => {
       const valid = this.#validateRtpPacket(raw)
       if (!valid) {
         return
       }
-      // console.log(raw)
-      // writeFileSync(this.#streamerPassthroughFifo, raw)
-      if (this.#streamer) {
+      if (this.#streamer && !this.#outputStreamerIsRestarting) {
+        if (firstWrite) {
+          firstWrite = false
+          this.#outputStreamLogger.info(
+            `First data from camera input reaching pipe:3 of output streamer pid=${this.#streamer.pid}`
+          )
+        }
         this.#packetsToOutputCount += 1
         this.#stalled = false
         // @ts-expect-error - this is correct
         this.#streamer.stdio[3].write(raw)
       }
     })
+    socket.on('end', () => logger.info(`camera.sock: client disconnected (end)`))
+    socket.on('close', () => logger.info(`camera.sock: client disconnected (close)`))
     socket.on('error', (error) => {
-      logger.error(error)
+      logger.error(`camera.sock client error: ${error.message}`)
     })
   }
 
-  #startOutputStreamer() {
+  #startOutputStreamer(useVaapi: boolean = false) {
     const ffmpegBinary = env.get('FFMPEG_BIN', 'ffmpeg')
-    const ffmpegArgs = [
+    const accelDevice = env.get('FFMPEG_HW_ACCELERATOR_DEVICE', '/dev/dri/renderD128')
+
+    const ffmpegArgs: string[] = [
       '-loglevel',
       env.get('FFMPEG_DEBUG_LEVEL', 'warning'),
       '-fflags',
       '+discardcorrupt+genpts',
       '-avoid_negative_ts',
       'make_zero',
+    ]
 
-      '-i',
-      `pipe:3`,
+    if (useVaapi) {
+      // init_hw_device + filter_hw_device is the explicit, portable VAAPI setup.
+      // -vaapi_device is a shorthand that can fail to propagate to the filtergraph
+      // on some driver versions; this form is unambiguous.
+      ffmpegArgs.push(
+        '-init_hw_device', `vaapi=va:${accelDevice}`,
+        '-filter_hw_device', 'va',
+      )
+      if (!this.#singleProcessMode) {
+        // Restart-based mode: process is created fresh for each source phase, so the
+        // decoder never sees a format change mid-stream. Hardware decode is safe here
+        // and keeps decoded frames in VAAPI surface memory for zero CPU round-trip.
+        ffmpegArgs.push(
+          '-hwaccel', 'vaapi',
+          '-hwaccel_output_format', 'vaapi',
+          '-hwaccel_device', 'va',
+          '-extra_hw_frames', '64',
+        )
+      }
+      // Single-process mode omits -hwaccel intentionally: the VAAPI hardware decoder
+      // does not support filter-chain reinitialization when the source changes resolution
+      // or profile mid-stream ("Error reinitializing filters, Function not implemented").
+      // Software decode handles SPS changes between the placeholder and live camera
+      // without error; the CPU cost of software decode is acceptable since hardware
+      // encode (h264_vaapi) still offloads the expensive part.
+    }
 
-      '-c:v',
-      'libx264',
-      '-preset',
-      'veryfast',
-      '-tune',
-      'zerolatency',
-      '-vf',
-      'fps=15',
-      '-b:v',
-      '2M',
-      '-maxrate',
-      '2M',
+    // Applied regardless of encoder: on severely corrupted/lossy RTP input the
+    // decoder (VAAPI hardware or software libx264) can spin producing rapid
+    // "Invalid data found" errors rather than dropping bad frames and continuing.
+    // ignore_err tells the decoder to absorb errors silently, preventing the
+    // error loop that was observed to delay SIGTERM response. This covers both the
+    // primary VAAPI path and the software fallback NestMTX switches to on a stall.
+    ffmpegArgs.push('-err_detect', 'ignore_err')
 
+    ffmpegArgs.push('-i', 'pipe:3')
+
+    if (useVaapi) {
+      if (this.#singleProcessMode) {
+        // Software decode → software scale to a fixed 1920×1080 → NV12 → hwupload → VAAPI encode.
+        // scale and format are software filters: they reinitialize gracefully when the
+        // input changes resolution or pixel format (placeholder → live camera switch).
+        // hwupload uploads the CPU NV12 frame into VAAPI surface memory for h264_vaapi.
+        // Fixed 1920×1080 output keeps the SRT stream's declared resolution constant
+        // regardless of what resolution the Nest camera happens to be streaming at.
+        ffmpegArgs.push(
+          '-vf',
+          'scale=1920:1080:flags=lanczos,format=nv12,hwupload=extra_hw_frames=64',
+          '-c:v',
+          'h264_vaapi',
+          '-b:v',
+          '2M',
+          '-maxrate',
+          '2M',
+        )
+      } else {
+        // scale_vaapi keeps the frame on the GPU and ensures NV12 format, which
+        // h264_vaapi requires. Replaces format=nv12,hwupload which would download
+        // to CPU then re-upload — that was what caused the swscaler warning.
+        ffmpegArgs.push(
+          '-vf',
+          'scale_vaapi=format=nv12',
+          '-c:v',
+          'h264_vaapi',
+          '-b:v',
+          '2M',
+          '-maxrate',
+          '2M',
+        )
+      }
+    } else {
+      ffmpegArgs.push(
+        '-c:v',
+        'libx264',
+        '-preset',
+        'veryfast',
+        '-tune',
+        'zerolatency',
+        '-vf',
+        'fps=15',
+        '-b:v',
+        '2M',
+        '-maxrate',
+        '2M'
+      )
+    }
+
+    ffmpegArgs.push(
       // AAC Audio Stream (track 1)
       '-c:a:0',
       'aac',
@@ -362,13 +498,16 @@ export default class NestmtxStream extends BaseCommand {
       '-f',
       'mpegts',
 
-      `"${this.#destination}"`,
-    ]
+      this.#destination,
+    )
 
+    this.#outputStreamLogger.info(
+      `Spawning output streamer: ${ffmpegBinary} ${ffmpegArgs.join(' ')}`
+    )
     this.#streamer = execa(ffmpegBinary, ffmpegArgs, {
       stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
       reject: false,
-      shell: true,
+      shell: false,
       signal: this.#abortController.signal,
     })
     this.#streamer.stdout!.on('data', (data) => {
@@ -388,17 +527,67 @@ export default class NestmtxStream extends BaseCommand {
         .map((line: string) => line.trim())
         .filter((line: string) => line.length > 0)
         .forEach((line: string) => {
-          if (line.includes('ERROR')) {
+          // Log all output streamer stderr regardless of level — needed to capture
+          // VAAPI init failures which may appear as non-ERROR prefixed lines.
+          if (line.toLowerCase().includes('error')) {
             this.#outputStreamLogger.error(line)
-          } else if (line.includes('INFO')) {
-            this.#outputStreamLogger.info(line)
           } else {
             this.#outputStreamLogger.info(line)
           }
+          // Detect filter-chain reinitialization failure in single-process mode.
+          // This is the "Error reinitializing filters, Function not implemented" error
+          // that occurs when the VAAPI hardware decoder sees a new SPS with different
+          // parameters. Set the flag so the exit handler can recover in-place.
+          if (this.#singleProcessMode && line.includes('Error reinitializing filters')) {
+            this.#singleProcessReinitActive = true
+          }
         })
+    })
+    // Node.js backs stdio[3] with a net.Socket internally. When the process is
+    // killed during a restart the socket emits 'error' (ECONNRESET / EPIPE).
+    // Without a listener that becomes an uncaught exception and crashes the process.
+    // @ts-expect-error - stdio[3] is a net.Socket at runtime
+    this.#streamer.stdio[3].on('error', (err: Error) => {
+      if (!this.#outputStreamerIsRestarting) {
+        this.#outputStreamLogger.error(`Output pipe fd3 error: ${err.message}`)
+      }
     })
     this.#streamer.on('exit', async (code) => {
       logger.info(`Streamer exited with code ${code}`)
+      if (this.#outputStreamerIsRestarting) {
+        return
+      }
+      // Single-process mode: a filter-chain reinit failure causes the output streamer
+      // to exit. Restart it in-place rather than tearing down the whole process so
+      // the camera ffmpeg (still running) can resume feeding data after a PLI.
+      // Without this, pm3 would respawn the entire per-camera process every 15-20s
+      // indefinitely, since the reinit failure is deterministic.
+      if (this.#singleProcessReinitActive) {
+        this.#singleProcessReinitActive = false
+        this.#singleProcessReinitCount++
+        if (this.#singleProcessReinitCount >= 3) {
+          this.#singleProcessFailed = true
+          logger.warning(
+            `single-process mode: ${this.#singleProcessReinitCount} consecutive reinit failures — disabling for this session, subsequent cycles will use restart-based mode`
+          )
+        } else {
+          logger.warning(
+            `single-process mode: reinit failure #${this.#singleProcessReinitCount}, restarting output streamer in-place`
+          )
+        }
+        // Restart with write-gating so camera data doesn't stream into a half-dead pipe.
+        this.#outputStreamerIsRestarting = true
+        this.#startOutputStreamer(true)
+        this.#outputStreamerIsRestarting = false
+        logger.info(
+          `single-process mode: output streamer restarted (pid=${this.#streamer?.pid}) after reinit failure`
+        )
+        // Request a fresh IDR + SPS/PPS so the new output streamer can decode cleanly.
+        if (this.#videoReceiver !== undefined && this.#videoSsrc !== undefined) {
+          this.#videoReceiver.sendRtcpPLI(this.#videoSsrc).catch(() => {})
+        }
+        return
+      }
       if (code !== 0 && code !== 8) {
         const res = await this.#streamer
         if (res) {
@@ -407,6 +596,100 @@ export default class NestmtxStream extends BaseCommand {
       }
       this.#gracefulExit(code || 0)
     })
+  }
+
+  async #restartOutputStreamer(useVaapi: boolean) {
+    // Kill the static placeholder explicitly before touching the output streamer.
+    // With shell:false the execa kill now hits ffmpeg directly (no shell orphan),
+    // but we still need to wait for the process to actually exit so no lingering
+    // data reaches pipe:3 of the new output streamer.
+    // Only done for the VAAPI transition (useVaapi=true); when switching back to
+    // software, #webrtcStart creates a new #staticStreamer concurrently and we
+    // must not kill it.
+    if (useVaapi && this.#staticStreamer) {
+      const ss = this.#staticStreamer
+      if (ss.exitCode === null) {
+        logger.info(`restartOutputStreamer: killing static streamer (pid ${ss.pid})`)
+        await new Promise<void>((resolve) => {
+          const timeout = setTimeout(() => {
+            logger.info(`restartOutputStreamer: static streamer kill timed out`)
+            resolve()
+          }, 2000)
+          ss.once('exit', (code) => {
+            clearTimeout(timeout)
+            logger.info(`restartOutputStreamer: static streamer exited with code ${code}`)
+            resolve()
+          })
+          try {
+            ss.kill('SIGTERM')
+          } catch {
+            // ESRCH: process already dead
+            clearTimeout(timeout)
+            logger.info(`restartOutputStreamer: static streamer already dead`)
+            resolve()
+          }
+        })
+      } else {
+        logger.info(`restartOutputStreamer: static streamer already exited (code ${ss.exitCode})`)
+      }
+      this.#staticStreamer = undefined
+    }
+
+    if (this.#streamer) {
+      logger.info(`restartOutputStreamer: killing output streamer, useVaapi=${useVaapi}`)
+      this.#outputStreamerIsRestarting = true
+      await new Promise<void>((resolve) => {
+        const streamer = this.#streamer!
+        let sigkillSent = false
+
+        // After 1.5s without exit, escalate to SIGKILL. The VAAPI hardware decoder
+        // can get wedged on corrupted input and stop responding to SIGTERM; SIGKILL
+        // is unconditional and ensures the old process is fully dead before the
+        // replacement starts, preventing any /dev/dri/renderD128 contention window.
+        const sigkillTimeout = setTimeout(() => {
+          if (streamer.exitCode !== null) return
+          sigkillSent = true
+          logger.info(
+            `restartOutputStreamer: output streamer SIGTERM unresponsive after 1.5s, escalating to SIGKILL (pid ${streamer.pid})`
+          )
+          try {
+            streamer.kill('SIGKILL')
+          } catch {}
+        }, 1500)
+
+        // Hard safety valve in case SIGKILL doesn't produce an exit event (zombie).
+        const hardTimeout = setTimeout(() => {
+          clearTimeout(sigkillTimeout)
+          logger.info(
+            `restartOutputStreamer: output streamer hard kill timeout (pid ${streamer.pid})`
+          )
+          resolve()
+        }, 3000)
+
+        streamer.once('exit', (code) => {
+          clearTimeout(sigkillTimeout)
+          clearTimeout(hardTimeout)
+          logger.info(
+            `restartOutputStreamer: output streamer exited with code ${code}${sigkillSent ? ' (after SIGKILL escalation)' : ''}`
+          )
+          resolve()
+        })
+
+        try {
+          streamer.kill('SIGTERM')
+        } catch {
+          // ESRCH: process already dead
+          clearTimeout(sigkillTimeout)
+          clearTimeout(hardTimeout)
+          logger.info(`restartOutputStreamer: output streamer already dead`)
+          resolve()
+        }
+      })
+      this.#outputStreamerIsRestarting = false
+    }
+    logger.info(`restartOutputStreamer: starting new output streamer (useVaapi=${useVaapi})`)
+    this.#startOutputStreamer(useVaapi)
+    logger.info(`restartOutputStreamer: new output streamer pid=${this.#streamer?.pid}`)
   }
 
   // ^(.*)\s+VBV\s+underflow\s+\(frame\s+\d+,\s+\-?\d+\s+bits\)$
@@ -509,10 +792,13 @@ export default class NestmtxStream extends BaseCommand {
       `unix:${this.#streamerPassthroughSock}`, // Send output to Unix socket
     ]
 
+    this.#staticStreamLogger.info(
+      `Spawning static input ffmpeg: ${ffmpegBinary} ${ffmpegArgs.join(' ')}`
+    )
     this.#staticStreamer = execa(ffmpegBinary, ffmpegArgs, {
       stdio: 'pipe',
       reject: false,
-      shell: true,
+      shell: false,
       signal,
     })
     this.#staticStreamer.catch((err) => {
@@ -526,7 +812,9 @@ export default class NestmtxStream extends BaseCommand {
     )
     this.#staticStreamer.on('exit', async (code, es?: NodeJS.Signals) => {
       logger.info(`Static Input FFMpeg exited with code ${code}`)
-      if (signal && signal.aborted) {
+      // During a planned output-streamer restart the static process may be killed
+      // explicitly before the output streamer. Don't treat that as a fatal error.
+      if ((signal && signal.aborted) || this.#outputStreamerIsRestarting) {
         return
       }
       if (code !== 0 && code !== 8 && es !== 'SIGABRT') {
@@ -620,14 +908,20 @@ export default class NestmtxStream extends BaseCommand {
       '-fflags',
       '+discardcorrupt+nobuffer', // Ignore corrupted frames and minimize buffering
 
-      // Hardware-accelerated decoding arguments
-      ...this.#hardwareAcceleratedDecodingArguments,
+      // Limit avformat_find_stream_info to 100ms. RTSP DESCRIBE already provides codec
+      // info; the 5s default analysis wait causes the same race as the WebRTC case.
+      '-analyzeduration',
+      '100000', // 100ms in microseconds
+
+      // No hwaccel decoding args: same reasoning as the WebRTC camera — -c:v copy
+      // passes the H264 bitstream through without decoding, so VAAPI decoding init
+      // is both unnecessary and conflicting with the VAAPI output streamer.
 
       // Rate-limit reading to the stream's own timestamps, absorbing CDN burst delivery
       '-re',
 
       '-i',
-      `"${rtspSrc}"`,
+      rtspSrc,
 
       // Retry options for network issues
       '-rtsp_transport',
@@ -661,19 +955,24 @@ export default class NestmtxStream extends BaseCommand {
       'mpegts',
       '-listen',
       '0',
-      `unix:${this.#cameraPassthroughSock}`, // Send output to Unix socket
 
-      // Optional: Limit the number of threads for real-time processing
+      // Limit threads before the output URL (trailing options after the URL are ignored)
       '-threads',
       '1',
+
+      `unix:${this.#cameraPassthroughSock}`,
     ]
 
     this.#connectingStreamAbortController.abort()
     this.#cameraStreamLogger.info(`Starting FFMpeg with RTSP stream`)
+    await this.#restartOutputStreamer(this.#isVaapiEnabled)
+    this.#cameraStreamLogger.info(
+      `Spawning RTSP camera ffmpeg: ${ffmpegBinary} ${ffmpegArgs.join(' ')}`
+    )
     this.#cameraStreamer = execa(ffmpegBinary, ffmpegArgs, {
       stdio: 'pipe',
       reject: false,
-      shell: true,
+      shell: false,
       signal: this.#abortController.signal,
     })
     this.#cameraStreamer.catch((err) => {
@@ -700,6 +999,7 @@ export default class NestmtxStream extends BaseCommand {
           camera.resolution || '640x480',
           this.#connectingStreamAbortController.signal
         )
+        void this.#restartOutputStreamer(false)
         void this.#rtspStart(service, camera, 0)
       }
     })
@@ -852,8 +1152,20 @@ export default class NestmtxStream extends BaseCommand {
       rtpPromiseAbortController.signal.addEventListener('abort', () => resolve(void 0))
     })
 
+    // Reset per-connection state so stale values from a previous WebRTC session
+    // don't leak into PLI sends for the new session's receiver/SSRC.
+    this.#videoReceiver = undefined
+    this.#videoSsrc = undefined
+
     pc.addEventListener('track', (event: RTCTrackEvent) => {
+      if (event.track.kind === 'video') {
+        this.#videoReceiver = event.receiver
+      }
       const { unSubscribe } = event.track.onReceiveRtp.subscribe((rtp) => {
+        // Capture the video SSRC from the first RTP packet so we can address PLI correctly.
+        if (event.track.kind === 'video' && this.#videoSsrc === undefined) {
+          this.#videoSsrc = rtp.header.ssrc
+        }
         switch (event.track.kind) {
           case 'video':
             this.#udpSocket!.send(rtp.serialize(), videoPort, '0.0.0.0', (error, _bytes) => {
@@ -958,6 +1270,7 @@ a=rtcp:${audioRTCPPort}
     await writeFile(this.#streamerFFMpegInputSdp, sdp)
     this.#connectingStreamAbortController.abort()
     this.#cameraStreamLogger.info(`Starting FFMpeg with WebRTC stream`)
+
     const ffmpegArgs: string[] = [
       '-y', // Overwrite output files
       '-hide_banner', // Hide FFmpeg banner
@@ -968,12 +1281,23 @@ a=rtcp:${audioRTCPPort}
       '-fflags',
       '+discardcorrupt+nobuffer', // Ignore corrupted frames and minimize buffering
 
-      // Hardware-accelerated decoding arguments
-      ...this.#hardwareAcceleratedDecodingArguments,
+      // Limit avformat_find_stream_info to 100ms instead of the default 5 seconds.
+      // The SDP already specifies the codec (H264 video, OPUS audio), so ffmpeg
+      // does not need to wait for actual RTP packets to know the stream layout.
+      // Without this, camera ffmpeg blocks for up to 5s before opening camera.sock,
+      // which is longer than the ~1.3s window before mediamtx's unDemand event
+      // kills the nestmtx:stream process.
+      '-analyzeduration',
+      '100000', // 100ms in microseconds
+
+      // No hwaccel decoding args here: -c:v copy means the H264 bitstream is
+      // forwarded as-is without decoding. Specifying -hwaccel vaapi alongside
+      // -c:v copy causes ffmpeg to attempt VAAPI device init and then hang
+      // because the device is already held by the VAAPI output streamer.
 
       // SDP input
       '-i',
-      `"${this.#streamerFFMpegInputSdp}"`, // SDP File input with quotes
+      this.#streamerFFMpegInputSdp,
 
       // Pass through video without re-encoding
       '-c:v',
@@ -1007,18 +1331,28 @@ a=rtcp:${audioRTCPPort}
       '-muxpreload',
       '0.1', // Set mux preload
 
-      // Output to Unix socket
-      `unix:${this.#cameraPassthroughSock}`, // Unix socket output for the MPEG-TS stream
-
-      // Optional: Limit the number of threads for real-time processing
+      // Limit threads before the output URL (trailing options after the URL are ignored)
       '-threads',
       '1',
+
+      // Output to Unix socket
+      `unix:${this.#cameraPassthroughSock}`,
     ]
 
+    // Spawn camera ffmpeg BEFORE the output-streamer restart so it opens the
+    // UDP ports immediately. SPS/PPS NAL units are sent by the WebRTC peer at
+    // the very start of the H264 stream. Waiting until after the restart (~1s)
+    // means they're gone and the H264 parser can never find frame boundaries,
+    // producing "non-existing PPS referenced" errors for the entire session.
+    // Data written to camera.sock during the restart is dropped by the
+    // #outputStreamerIsRestarting guard, which is correct.
+    this.#cameraStreamLogger.info(
+      `Spawning WebRTC camera ffmpeg: ${ffmpegBinary} ${ffmpegArgs.join(' ')}`
+    )
     this.#cameraStreamer = execa(ffmpegBinary, ffmpegArgs, {
       stdio: 'pipe',
       reject: false,
-      shell: true,
+      shell: false,
       signal: this.#abortController.signal,
     })
 
@@ -1040,12 +1374,97 @@ a=rtcp:${audioRTCPPort}
         }
         this.#gracefulExit(code || 0)
       } else {
+        if (!this.#singleProcessMode) {
+          // Restart-based mode: restart back to software before starting a new
+          // placeholder phase (the next #webrtcStart call starts a new static input
+          // and will restart to VAAPI again when the camera reconnects).
+          void this.#restartOutputStreamer(false)
+        } else {
+          // Single-process mode: output streamer stays in VAAPI mode throughout.
+          // The new static input will be fed as H264 to the same running VAAPI
+          // output streamer; the VAAPI decoder sees another SPS transition (live
+          // camera → placeholder H264) which is also part of what we're testing.
+          this.#cameraStreamLogger.info(
+            `single-process mode: camera exited, output streamer pid=${this.#streamer?.pid} stays running`
+          )
+        }
         void this.#webrtcStart(service, camera)
       }
     })
+
+    // Diagnostic: log process state at T+2s so we can see whether camera ffmpeg
+    // is alive, already exited, or just silent at that point in the timeline.
+    const diagnosticRef = this.#cameraStreamer
+    setTimeout(() => {
+      this.#cameraStreamLogger.info(
+        `[diag T+2s] cameraStreamer pid=${diagnosticRef.pid} exitCode=${diagnosticRef.exitCode ?? 'null(running)'} | outputStreamer pid=${this.#streamer?.pid} exitCode=${this.#streamer?.exitCode ?? 'null(running)'}`
+      )
+    }, 2000)
+
+    if (!this.#singleProcessMode) {
+      // Restart-based mode (default): kill the software output streamer and
+      // spawn a new VAAPI one. Two PLIs bridge the ~400ms kill/respawn gap —
+      // the early one puts the camera's keyframe round-trip in flight while the
+      // restart runs; the post-restart one ensures the new output streamer gets
+      // a clean IDR once it's ready to receive data.
+      if (this.#videoReceiver !== undefined && this.#videoSsrc !== undefined) {
+        this.#cameraStreamLogger.info(
+          `Sending early PLI before restart (video SSRC=${this.#videoSsrc})`
+        )
+        this.#videoReceiver.sendRtcpPLI(this.#videoSsrc).catch((err: any) => {
+          this.#cameraStreamLogger.warning(`Early PLI send failed: ${err.message}`)
+        })
+      } else {
+        this.#cameraStreamLogger.warning(
+          `Early PLI skipped: videoReceiver=${this.#videoReceiver !== undefined}, videoSsrc=${this.#videoSsrc}`
+        )
+      }
+
+      await this.#restartOutputStreamer(this.#isVaapiEnabled)
+
+      if (this.#videoReceiver !== undefined && this.#videoSsrc !== undefined) {
+        this.#cameraStreamLogger.info(
+          `Sending post-restart PLI (video SSRC=${this.#videoSsrc})`
+        )
+        try {
+          await this.#videoReceiver.sendRtcpPLI(this.#videoSsrc)
+        } catch (err: any) {
+          this.#cameraStreamLogger.warning(`Post-restart PLI send failed: ${err.message}`)
+        }
+      } else {
+        this.#cameraStreamLogger.warning(
+          `Post-restart PLI skipped: videoReceiver=${this.#videoReceiver !== undefined}, videoSsrc=${this.#videoSsrc}`
+        )
+      }
+    } else {
+      // Single-process investigation mode: output streamer is already running in
+      // VAAPI mode with software decode, so it handles the SPS change when camera
+      // data arrives on pipe:3. Do not restart it — just send a PLI so the camera
+      // delivers a fresh IDR + SPS/PPS for the new output streamer to start from.
+      this.#cameraStreamLogger.info(
+        `single-process mode: skipping restart, output streamer pid=${this.#streamer?.pid} stays in VAAPI mode`
+      )
+      if (this.#videoReceiver !== undefined && this.#videoSsrc !== undefined) {
+        this.#cameraStreamLogger.info(
+          `Sending PLI for fresh keyframe (single-process, video SSRC=${this.#videoSsrc})`
+        )
+        try {
+          await this.#videoReceiver.sendRtcpPLI(this.#videoSsrc)
+        } catch (err: any) {
+          this.#cameraStreamLogger.warning(`Single-process PLI send failed: ${err.message}`)
+        }
+      } else {
+        this.#cameraStreamLogger.warning(
+          `Single-process PLI skipped: videoReceiver=${this.#videoReceiver !== undefined}, videoSsrc=${this.#videoSsrc}`
+        )
+      }
+    }
   }
 
   #gracefulExit(code: number = 0) {
+    logger.info(
+      `gracefulExit(${code}): cameraStreamer pid=${this.#cameraStreamer?.pid} exitCode=${this.#cameraStreamer?.exitCode ?? 'null'}, streamer pid=${this.#streamer?.pid} exitCode=${this.#streamer?.exitCode ?? 'null'}`
+    )
     if (this.#streamer) {
       this.#streamer.kill('SIGKILL')
     }

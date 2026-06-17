@@ -84,6 +84,16 @@ export class MediaMTXService {
     return [...this.#paths].map(([, path]) => path)
   }
 
+  async isPathReady(path: string): Promise<boolean> {
+    if (!this.#apiClient) return false
+    try {
+      const { data } = await this.#apiClient.pathsGet({ name: path })
+      return data?.ready === true
+    } catch {
+      return false
+    }
+  }
+
   async boot(_logger: LoggerService, nat: NATService, ice: ICEService, pm3: PM3) {
     pm3.on('stdout:mediamtx', (data) => {
       this.#logFromMediaMtx(data)
@@ -207,6 +217,7 @@ export class MediaMTXService {
         // runOnInitRestart: false,
         runOnDemand: [...baseRunOnCommand, 'demand'].join(' '),
         runOnDemandStartTimeout: '60s',
+        runOnDemandCloseAfter: '10s',
         runOnDemandRestart: false,
         runOnUnDemand: [...baseRunOnCommand, 'unDemand'].join(' '),
         runOnReady: [...baseRunOnCommand, 'ready'].join(' '),

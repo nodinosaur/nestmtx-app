@@ -39,6 +39,7 @@ export class StreamerService {
   readonly #internalApiPort: number
   readonly #logger: winston.Logger
   readonly #lastDataCounts: Map<string, number>
+  readonly #zeroReaderSince: Map<string, number> = new Map()
 
   #ffmpegHwAccelerator?: string
   #ffmpegHwAcceleratorDevice?: string
@@ -149,12 +150,11 @@ export class StreamerService {
   }
 
   async cronjob() {
-    /**
-     * For all live paths that are streaming, check that the amount of data received is continuing to increase.
-     * If the amount of data received is not increasing, then the stream is stalled and should be restarted.
-     */
     const paths = this.#app.mediamtx.getPaths()
     const livePaths = paths.filter((path) => path.ready)
+
+    // Stall detection: if dataRx hasn't grown since the last check, the stream
+    // is stuck and needs a kick.
     livePaths.forEach((path) => {
       const last = this.#lastDataCounts.get(path.path)
       if ('number' === typeof last && last >= path.dataRx) {
@@ -169,6 +169,49 @@ export class StreamerService {
       }
       this.#lastDataCounts.set(path.path, path.dataRx)
     })
+
+    // Zero-reader teardown: mediamtx fires runOnUnDemand once per demand cycle.
+    // After a publisher swap (VAAPI restart), the demand cycle ends mid-restart
+    // when the #onUnDemand 8s recheck skips teardown. If nobody reconnects after
+    // that, mediamtx will never fire runOnUnDemand again — the path sits with a
+    // healthy publisher and zero readers indefinitely. Poll here to catch that
+    // state and clean up.
+    const ZERO_READER_TEARDOWN_MS = 30_000
+    const now = Date.now()
+    const livePathNames = new Set(livePaths.map((p) => p.path))
+    for (const key of this.#zeroReaderSince.keys()) {
+      if (!livePathNames.has(key)) {
+        this.#zeroReaderSince.delete(key)
+      }
+    }
+    for (const path of livePaths) {
+      const processName = this.#getMtxProcessName(path.path)
+      const proc = this.#app.pm3.get(processName)
+      if (!proc || proc.exitCode !== null || typeof proc.pid === 'undefined') {
+        this.#zeroReaderSince.delete(path.path)
+        continue
+      }
+      if (path.consumers === 0) {
+        const first = this.#zeroReaderSince.get(path.path)
+        if (first === undefined) {
+          this.#zeroReaderSince.set(path.path, now)
+          this.#logger.info(
+            `"${path.path}" is ready with 0 readers — starting teardown timer`
+          )
+        } else if (now - first >= ZERO_READER_TEARDOWN_MS) {
+          this.#logger.info(
+            `"${path.path}" has had 0 readers for >${ZERO_READER_TEARDOWN_MS / 1000}s — tearing down`
+          )
+          this.#zeroReaderSince.delete(path.path)
+          await this.#shutdownCameraProcess(path.path)
+        }
+      } else {
+        if (this.#zeroReaderSince.has(path.path)) {
+          this.#logger.info(`"${path.path}" has readers again — cancelling teardown timer`)
+          this.#zeroReaderSince.delete(path.path)
+        }
+      }
+    }
   }
 
   async #getAvailableHwAccelerators() {
@@ -279,7 +322,7 @@ export class StreamerService {
   }
 
   async #onUnDemand(payload: DemandEventPayload) {
-    this.#logger?.info(`Received demand for "${payload.MTX_PATH}"`)
+    this.#logger?.info(`Received unDemand for "${payload.MTX_PATH}"`)
     let camera: Camera | null | undefined
     try {
       camera = await Camera.findBy({ mtx_path: payload.MTX_PATH })
@@ -296,16 +339,50 @@ export class StreamerService {
       )
       return
     }
-    const processName = this.#getMtxProcessName(payload.MTX_PATH)
+    // Distinguish between two unDemand causes by checking publisher state immediately:
+    //
+    // A) Mid-restart: the old SRT publisher was killed during a VAAPI switch; mediamtx
+    //    terminated reader sessions as a side-effect, firing unDemand. The new VAAPI
+    //    output streamer needs ~5-6s from camera-ffmpeg spawn to open SRT, so at the
+    //    moment this IPC event arrives (~1.3s after the kill) there is no publisher yet.
+    //    → isPathReady returns false → wait 8s then recheck.
+    //
+    // B) Genuine viewer disconnect: the VAAPI (or placeholder) publisher is still running;
+    //    all viewers simply closed their connections.
+    //    → isPathReady returns true → tear down immediately.
+    const pathReadyNow = await this.#app.mediamtx.isPathReady(payload.MTX_PATH)
+    if (pathReadyNow) {
+      this.#logger?.info(
+        `"${payload.MTX_PATH}" unDemand with active publisher — all viewers left, proceeding with shutdown`
+      )
+      await this.#shutdownCameraProcess(payload.MTX_PATH)
+      return
+    }
+    // No publisher at unDemand time — likely mid-restart. Wait for the VAAPI pipeline
+    // to fully start (decode → filter → encode → SRT open).
+    await new Promise<void>((resolve) => setTimeout(resolve, 8000))
+    const pathNowReady = await this.#app.mediamtx.isPathReady(payload.MTX_PATH)
+    if (pathNowReady) {
+      this.#logger?.info(
+        `"${payload.MTX_PATH}" has an active publisher after 8s recheck — source switch completed, skipping shutdown`
+      )
+      return
+    }
+    this.#logger?.info(
+      `"${payload.MTX_PATH}" has no publisher after 8s recheck — proceeding with shutdown`
+    )
+    await this.#shutdownCameraProcess(payload.MTX_PATH)
+  }
+
+  async #shutdownCameraProcess(path: string) {
+    const processName = this.#getMtxProcessName(path)
     const process = this.#app.pm3.get(processName)
     if (process) {
       if (process.exitCode === null && 'undefined' !== typeof process.pid) {
-        this.#logger?.info(
-          `Shutting down process with PID "${process.pid}" for "${payload.MTX_PATH}"`
-        )
+        this.#logger?.info(`Shutting down process with PID "${process.pid}" for "${path}"`)
         await this.#app.pm3.stop(processName)
       }
-      this.#logger?.info(`Cleaning up process with PID "${process.pid}" for "${payload.MTX_PATH}"`)
+      this.#logger?.info(`Cleaning up process with PID "${process.pid}" for "${path}"`)
       await this.#app.pm3.remove(processName)
     }
   }
