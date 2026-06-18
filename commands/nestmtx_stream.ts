@@ -94,6 +94,8 @@ export default class NestmtxStream extends BaseCommand {
   #detectedCameraProfile?: string     // e.g. "High", "Main"
   #detectedCameraColorspace?: string  // e.g. "bt709" or "bt470bg/unknown/unknown"
   #detectedCameraFrameRate?: number   // e.g. 30
+  #detectedCameraRefs?: number        // num_ref_frames, e.g. 3 — passed to libx264 as -refs N
+  #detectedCameraLevel?: string       // H264 level string, e.g. "3.1" — passed to libx264 as -level X.Y
   #singleProcessCameraActive: boolean = false
   // Timestamp (ms) of the first format detection in the current camera phase.
   // 0 = not yet detected. Guards against the encoder's own output-side stream-info
@@ -564,7 +566,12 @@ export default class NestmtxStream extends BaseCommand {
             if (isFirstDetection || isRedetectionWindow) {
               const m = line.match(/Video: h264 \(([^)]+)\).*?(\d{3,4}x\d{3,4})/)
               if (m) {
-                const newProfile = m[1]
+                // Profile string may include an @L suffix on some builds (e.g. "Main@L3.1").
+                // Strip it so -profile:v receives a clean value. Level and refs are now
+                // detected via ffprobe (before camera ffmpeg spawns) — not from this line.
+                const rawProfile = m[1]
+                const atLIdx = rawProfile.indexOf('@L')
+                const newProfile = atLIdx !== -1 ? rawProfile.slice(0, atLIdx).trim() : rawProfile
                 const newSize = m[2]
 
                 // Extract colorspace from the pixel format section, e.g.:
@@ -590,11 +597,11 @@ export default class NestmtxStream extends BaseCommand {
 
                 if (isFirstDetection) {
                   this.#outputStreamLogger.info(
-                    `single-process mode: stored camera format — size=${newSize} profile=${newProfile} colorspace=${newColorspace ?? 'undetected'} fps=${newFrameRate ?? 'undetected'} (from line: ${line.substring(0, 120)})`
+                    `single-process mode: stored camera format — size=${newSize} profile=${newProfile} colorspace=${newColorspace ?? 'undetected'} fps=${newFrameRate ?? 'undetected'} refs=${this.#detectedCameraRefs ?? 'undetected'} level=${this.#detectedCameraLevel ?? 'undetected'} (from line: ${line.substring(0, 120)})`
                   )
                 } else {
                   this.#outputStreamLogger.info(
-                    `single-process mode: camera format changed mid-session — size=${newSize} (was ${prevSize ?? 'none'}) profile=${newProfile} (was ${prevProfile ?? 'none'}) colorspace=${newColorspace ?? 'undetected'} (was ${prevColorspace ?? 'undetected'}) fps=${newFrameRate ?? 'undetected'} (from line: ${line.substring(0, 120)})`
+                    `single-process mode: camera format changed mid-session — size=${newSize} (was ${prevSize ?? 'none'}) profile=${newProfile} (was ${prevProfile ?? 'none'}) colorspace=${newColorspace ?? 'undetected'} (was ${prevColorspace ?? 'undetected'}) fps=${newFrameRate ?? 'undetected'} refs=${this.#detectedCameraRefs ?? 'undetected'} level=${this.#detectedCameraLevel ?? 'undetected'} (from line: ${line.substring(0, 120)})`
                   )
                 }
               }
@@ -627,11 +634,11 @@ export default class NestmtxStream extends BaseCommand {
         if (this.#singleProcessReinitCount >= 3) {
           this.#singleProcessFailed = true
           logger.warning(
-            `single-process mode: ${this.#singleProcessReinitCount} consecutive reinit failures — disabling for this session, subsequent cycles will use restart-based mode (detectedSize=${this.#detectedCameraSize ?? 'none'} detectedProfile=${this.#detectedCameraProfile ?? 'none'} detectedColorspace=${this.#detectedCameraColorspace ?? 'none'})`
+            `single-process mode: ${this.#singleProcessReinitCount} consecutive reinit failures — disabling for this session, subsequent cycles will use restart-based mode (detectedSize=${this.#detectedCameraSize ?? 'none'} detectedProfile=${this.#detectedCameraProfile ?? 'none'} detectedColorspace=${this.#detectedCameraColorspace ?? 'none'} detectedRefs=${this.#detectedCameraRefs ?? 'none'} detectedLevel=${this.#detectedCameraLevel ?? 'none'})`
           )
         } else {
           logger.warning(
-            `single-process mode: reinit failure #${this.#singleProcessReinitCount} — restarting output streamer in-place (detectedSize=${this.#detectedCameraSize ?? 'none'} detectedProfile=${this.#detectedCameraProfile ?? 'none'} detectedColorspace=${this.#detectedCameraColorspace ?? 'none'})`
+            `single-process mode: reinit failure #${this.#singleProcessReinitCount} — restarting output streamer in-place (detectedSize=${this.#detectedCameraSize ?? 'none'} detectedProfile=${this.#detectedCameraProfile ?? 'none'} detectedColorspace=${this.#detectedCameraColorspace ?? 'none'} detectedRefs=${this.#detectedCameraRefs ?? 'none'} detectedLevel=${this.#detectedCameraLevel ?? 'none'})`
           )
         }
         // Restart with write-gating so camera data doesn't stream into a half-dead pipe.
@@ -798,23 +805,28 @@ export default class NestmtxStream extends BaseCommand {
       })
   }
 
-  #streamJpegToOutputStream(src: string, size: string = '640x480', signal?: AbortSignal, profile?: string, colorspace?: string, frameRate?: number) {
+  #streamJpegToOutputStream(src: string, size: string = '640x480', signal?: AbortSignal, profile?: string, colorspace?: string, frameRate?: number, refs?: number, level?: string) {
     const ffmpegBinary = env.get('FFMPEG_BIN', 'ffmpeg')
 
-    // Pre-compute colorspace flags. Format is a single value like "bt709" (applied
-    // to all three color parameters) or three slash-separated values
-    // "primaries/trc/space". "unknown" is skipped — passing it to ffmpeg produces
-    // a warning but no useful output, and the default (unspecified) is safer.
-    const colorspaceArgs: string[] = []
-    if (colorspace) {
-      const parts = colorspace.split('/')
-      const primaries = parts[0]
-      const trc = parts.length >= 2 ? parts[1] : primaries
-      const space = parts.length >= 3 ? parts[2] : primaries
-      if (primaries && primaries !== 'unknown') colorspaceArgs.push('-color_primaries', primaries)
-      if (trc && trc !== 'unknown') colorspaceArgs.push('-color_trc', trc)
-      if (space && space !== 'unknown') colorspaceArgs.push('-colorspace', space)
-    }
+    // Round 28 isolation test: colorspace flags deliberately NOT applied to the
+    // placeholder ffmpeg command. Detection and storage of #detectedCameraColorspace
+    // are unchanged — the value is still captured and logged from the camera's
+    // stream-info line. Only the application step is removed here.
+    //
+    // Rationale: Round 27 found that matched-format cycles consistently hit exactly
+    // 2 reinit errors (one live→placeholder, one placeholder→camera). Round 25 —
+    // structurally identical — had zero. The only thing that changed between them
+    // was Round 26's colorspace-splitting fix, which introduced explicit
+    // -color_range / -color_primaries / -color_trc / -colorspace flags that were
+    // absent before (previously the colorspace string was mishandled by ffmpeg and
+    // effectively silently ignored). This round tests whether removing those flags
+    // restores the Round 25 result.
+    //
+    // If matched-format cycles come back clean → colorspace flags were the
+    //   regression; resolution+profile+pix_fmt was sufficient all along.
+    // If reinit errors persist → colorspace wasn't the cause; the Round 25 vs 27
+    //   difference lies elsewhere and the pixel-format hypothesis (yuv420p vs
+    //   yuvj420p) becomes the next candidate.
 
     const ffmpegArgs = [
       '-loglevel',
@@ -842,8 +854,17 @@ export default class NestmtxStream extends BaseCommand {
       // "baseline" for the first cycle (before any format is detected) or in
       // restart-based mode where profile matching is not needed.
       profile ? profile.toLowerCase().replace(/ /g, '_') : 'baseline',
-      '-tune',
-      'zerolatency',
+      // Empirical SPS matching for the matched-format placeholder (profile provided).
+      // -refs 2: confirmed via VAAPI-encoded SRT output.
+      // -level 3.2: ffprobe on the VAAPI SRT output confirmed level=32 (Level 3.2);
+      //   3.1 was one step too low.
+      // -tune zerolatency omitted here: it disables B-frames (has_b_frames=0), but
+      //   the VAAPI output shows has_b_frames=1, matching what the camera's native
+      //   H.264 produces. Without this tune, libx264 uses B-frames by default,
+      //   keeping the placeholder SPS consistent with the camera side.
+      // If dynamically-detected values are ever provided they take precedence.
+      ...(refs !== undefined ? ['-refs', String(refs)] : profile !== undefined ? ['-refs', '2'] : []),
+      ...(level !== undefined ? ['-level', level] : profile !== undefined ? ['-level', '3.2'] : []),
       '-r',
       frameRate ? String(Math.round(frameRate)) : '2', // match camera fps; default 2fps for static placeholder
       '-b:v',
@@ -852,7 +873,7 @@ export default class NestmtxStream extends BaseCommand {
       size,
       '-pix_fmt',
       'yuv420p',
-      ...colorspaceArgs,
+      // no colorspace flags — Round 28 isolation test, see comment above
 
       // AAC Audio Stream (track 1)
       '-c:a:0',
@@ -1104,7 +1125,7 @@ export default class NestmtxStream extends BaseCommand {
     // Diagnostic: dump format-matching state at session start so every subsequent
     // log entry can be cross-referenced against what was known at this point.
     this.#cameraStreamLogger.info(
-      `webrtcStart: singleProcessMode=${this.#singleProcessMode} singleProcessFailed=${this.#singleProcessFailed} detectedSize=${this.#detectedCameraSize ?? 'none'} detectedProfile=${this.#detectedCameraProfile ?? 'none'} detectedColorspace=${this.#detectedCameraColorspace ?? 'none'} detectedFrameRate=${this.#detectedCameraFrameRate ?? 'none'}`
+      `webrtcStart: singleProcessMode=${this.#singleProcessMode} singleProcessFailed=${this.#singleProcessFailed} detectedSize=${this.#detectedCameraSize ?? 'none'} detectedProfile=${this.#detectedCameraProfile ?? 'none'} detectedColorspace=${this.#detectedCameraColorspace ?? 'none'} detectedFrameRate=${this.#detectedCameraFrameRate ?? 'none'} detectedRefs=${this.#detectedCameraRefs ?? 'none'} detectedLevel=${this.#detectedCameraLevel ?? 'none'}`
     )
 
     this.#connectingStreamAbortController = new AbortController()
@@ -1125,8 +1146,14 @@ export default class NestmtxStream extends BaseCommand {
     const placeholderFrameRate = (this.#singleProcessMode && this.#detectedCameraFrameRate)
       ? this.#detectedCameraFrameRate
       : undefined
+    const placeholderRefs = (this.#singleProcessMode && this.#detectedCameraRefs !== undefined)
+      ? this.#detectedCameraRefs
+      : undefined
+    const placeholderLevel = (this.#singleProcessMode && this.#detectedCameraLevel)
+      ? this.#detectedCameraLevel
+      : undefined
     this.#cameraStreamLogger.info(
-      `webrtcStart: starting placeholder — size=${placeholderSize} profile=${placeholderProfile ?? 'baseline(default)'} colorspace=${placeholderColorspace ?? 'undetected'} fps=${placeholderFrameRate ?? '2(default)'} (reason: ${this.#singleProcessMode && this.#detectedCameraSize ? 'matched detected camera format' : this.#singleProcessMode ? 'single-process mode but no detection yet' : 'restart-based mode or mode disabled'})`
+      `webrtcStart: starting placeholder — size=${placeholderSize} profile=${placeholderProfile ?? 'baseline(default)'} colorspace=${placeholderColorspace ?? 'undetected'} fps=${placeholderFrameRate ?? '2(default)'} refs=${placeholderRefs ?? 'undetected'} level=${placeholderLevel ?? 'undetected'} (reason: ${this.#singleProcessMode && this.#detectedCameraSize ? 'matched detected camera format' : this.#singleProcessMode ? 'single-process mode but no detection yet' : 'restart-based mode or mode disabled'})`
     )
     this.#streamJpegToOutputStream(
       this.#connectingFilePath,
@@ -1135,6 +1162,8 @@ export default class NestmtxStream extends BaseCommand {
       placeholderProfile,
       placeholderColorspace,
       placeholderFrameRate,
+      placeholderRefs,
+      placeholderLevel,
     )
 
     const getPortOptions: PickPortOptions = {
@@ -1517,7 +1546,7 @@ a=rtcp:${audioRTCPPort}
         // mode is disabled for the session.
         this.#singleProcessReinitCount++
         this.#cameraStreamLogger.warning(
-          `single-process mode: camera crashed unexpectedly (code=${code}) — recovering in-place, failure #${this.#singleProcessReinitCount} (detectedSize=${this.#detectedCameraSize ?? 'none'} detectedProfile=${this.#detectedCameraProfile ?? 'none'} detectedColorspace=${this.#detectedCameraColorspace ?? 'none'})`
+          `single-process mode: camera crashed unexpectedly (code=${code}) — recovering in-place, failure #${this.#singleProcessReinitCount} (detectedSize=${this.#detectedCameraSize ?? 'none'} detectedProfile=${this.#detectedCameraProfile ?? 'none'} detectedColorspace=${this.#detectedCameraColorspace ?? 'none'} detectedRefs=${this.#detectedCameraRefs ?? 'none'} detectedLevel=${this.#detectedCameraLevel ?? 'none'})`
         )
         if (this.#singleProcessReinitCount >= 3) {
           this.#singleProcessFailed = true
@@ -1554,6 +1583,18 @@ a=rtcp:${audioRTCPPort}
           // output streamer; the VAAPI decoder sees another SPS transition (live
           // camera → placeholder H264) which is also part of what we're testing.
           this.#singleProcessCameraActive = false
+          // A clean camera exit means this session ran to completion — any prior
+          // in-place recovery was successful. Reset the consecutive-failure counter
+          // so the next cycle gets its full 3 attempts rather than inheriting
+          // failure debt from earlier cycles in the same process lifetime.
+          // Note: #singleProcessFailed is intentionally NOT reset here — once mode
+          // is explicitly disabled for the session it stays disabled.
+          if (this.#singleProcessReinitCount > 0) {
+            this.#cameraStreamLogger.info(
+              `single-process mode: camera session completed cleanly — resetting reinit count to 0 (was ${this.#singleProcessReinitCount})`
+            )
+            this.#singleProcessReinitCount = 0
+          }
           this.#cameraStreamLogger.info(
             `single-process mode: camera exited, output streamer pid=${this.#streamer?.pid} stays running`
           )
@@ -1628,6 +1669,7 @@ a=rtcp:${audioRTCPPort}
           `Single-process PLI skipped: videoReceiver=${this.#videoReceiver !== undefined}, videoSsrc=${this.#videoSsrc}`
         )
       }
+
     }
   }
 

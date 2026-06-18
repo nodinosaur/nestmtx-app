@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import Camera from '#models/camera'
 import { CronJob } from '#services/cron'
 import { logger as main } from '#services/logger'
@@ -18,6 +19,12 @@ export default class ExtendCameraStreamAuthenticationJob extends CronJob {
       return
     }
     const logger = main.child({ service: 'cron', job: 'cameras.extend' })
+    // Test harness hook: touching /tmp/nestmtx-pause-extension inside the container
+    // prevents token renewal for one expiry window, forcing a clean camera reconnect.
+    if (existsSync('/tmp/nestmtx-pause-extension')) {
+      logger.info('Stream extension paused by test harness (/tmp/nestmtx-pause-extension present)')
+      return
+    }
     const livePaths = this.#app.mediamtx.paths.map((path) => path.path)
     const liveCameras = await Camera.query()
       .whereIn('mtx_path', livePaths)
