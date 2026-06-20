@@ -73,6 +73,12 @@ export default class NestmtxStream extends BaseCommand {
   #lastUnderflowWarningAt?: DateTime
   #clearUnderflowWarningInterval?: NodeJS.Timeout
 
+  // Local SRT relay port: camera ffmpeg publishes MPEG-TS here as an SRT listener;
+  // the VAAPI output streamer reads from it as a caller. Set in #webrtcStart (restart-
+  // based mode only) before camera ffmpeg is spawned. Undefined in single-process mode
+  // and for the RTSP path, which both continue to use the Unix socket → pipe:3 path.
+  #cameraRelayPort?: number
+
   // Single-process mode state: track reinit failures so we can recover in-place
   // rather than crashing the whole process, and disable the mode after repeated failures.
   #singleProcessReinitCount: number = 0
@@ -161,6 +167,10 @@ export default class NestmtxStream extends BaseCommand {
 
   get #isVaapiEnabled() {
     return env.get('FFMPEG_HW_ACCELERATOR', '').toLowerCase() === 'vaapi'
+  }
+
+  get #isHwAccelEnabled() {
+    return env.get('FFMPEG_HW_ACCELERATOR', '') !== ''
   }
 
   // Experimental single-process investigation mode. When VAAPI_SINGLE_PROCESS=true
@@ -285,8 +295,15 @@ export default class NestmtxStream extends BaseCommand {
       if (this.#lastThirtyPacketCounts.length > 30) {
         this.#lastThirtyPacketCounts.shift()
       }
+      // In SRT relay mode (camera phase) data flows camera ffmpeg → SRT → output
+      // streamer without touching Node, so #packetsToOutputCount stays at zero even
+      // when the stream is healthy. Skip the packet-count stall check for this case;
+      // camera crashes are already detected by the camera ffmpeg exit handler.
+      const cameraIsActiveInSrtMode =
+        this.#cameraRelayPort !== undefined && this.#cameraStreamer?.exitCode === null
       if (
         !this.#stalled &&
+        !cameraIsActiveInSrtMode &&
         this.#lastThirtyPacketCounts.length === 30 &&
         this.#lastThirtyPacketCounts.every((count) => count === 0) &&
         ((this.#staticStreamer && this.#staticStreamer.pid) ||
@@ -350,14 +367,16 @@ export default class NestmtxStream extends BaseCommand {
         return
       }
       if (this.#streamer && !this.#outputStreamerIsRestarting) {
+        // @ts-expect-error - stdio[3] is a net.Socket in pipe mode; absent in SRT relay mode
+        const fd3 = this.#streamer.stdio[3]
+        if (!fd3) return
         if (firstWrite) {
           firstWrite = false
           this.#outputStreamLogger.info(`First data from static input reaching pipe:3`)
         }
         this.#packetsToOutputCount += 1
         this.#stalled = false
-        // @ts-expect-error - this is correct
-        this.#streamer.stdio[3].write(raw)
+        fd3.write(raw)
       }
     })
     socket.on('end', () => logger.info(`streamer.sock: client disconnected (end)`))
@@ -376,6 +395,9 @@ export default class NestmtxStream extends BaseCommand {
         return
       }
       if (this.#streamer && !this.#outputStreamerIsRestarting) {
+        // @ts-expect-error - stdio[3] is a net.Socket in pipe mode; absent in SRT relay mode
+        const fd3 = this.#streamer.stdio[3]
+        if (!fd3) return
         if (firstWrite) {
           firstWrite = false
           this.#outputStreamLogger.info(
@@ -384,8 +406,7 @@ export default class NestmtxStream extends BaseCommand {
         }
         this.#packetsToOutputCount += 1
         this.#stalled = false
-        // @ts-expect-error - this is correct
-        this.#streamer.stdio[3].write(raw)
+        fd3.write(raw)
       }
     })
     socket.on('end', () => logger.info(`camera.sock: client disconnected (end)`))
@@ -395,16 +416,22 @@ export default class NestmtxStream extends BaseCommand {
     })
   }
 
-  #startOutputStreamer(useVaapi: boolean = false) {
+  #startOutputStreamer(useHwAccel: boolean = false) {
     const ffmpegBinary = env.get('FFMPEG_BIN', 'ffmpeg')
-    const accelDevice = env.get('FFMPEG_HW_ACCELERATOR_DEVICE', '/dev/dri/renderD128')
+    const hwAccel = useHwAccel ? env.get('FFMPEG_HW_ACCELERATOR', '').toLowerCase() : ''
+    const accelDevice = env.get('FFMPEG_HW_ACCELERATOR_DEVICE', '')
+    const isVaapi = hwAccel === 'vaapi'
+    const isCuda = hwAccel === 'nvenc' || hwAccel === 'nvdec' || hwAccel === 'cuvid'
+    const isVideoToolbox = hwAccel === 'videotoolbox'
+    const isQsv = hwAccel === 'qsv'
 
-    // In single-process mode we need ffmpeg to emit stream-info lines so we can
-    // detect the camera's resolution and H264 profile. Those lines are logged at
-    // ffmpeg's "info" level — they are suppressed by the default "warning" level.
-    // Boost to "info" only for this path; the extra verbosity is acceptable for
-    // an experimental mode and the detection logic filters what it cares about.
-    const logLevel = (useVaapi && this.#singleProcessMode)
+    // Log level selection:
+    //  - Single-process VAAPI: 'info' — needed for stream-info lines that drive
+    //    format detection (camera resolution/profile for placeholder matching).
+    //  - All other modes: env default ('warning', or higher if FFMPEG_DEBUG_LEVEL set).
+    //    'verbose' was tried in Round 37 but the expected "Reinit context" hwaccel
+    //    signal did not appear even at that level — not worth the log volume.
+    const logLevel = (isVaapi && this.#singleProcessMode)
       ? 'info'
       : env.get('FFMPEG_DEBUG_LEVEL', 'warning')
 
@@ -417,39 +444,111 @@ export default class NestmtxStream extends BaseCommand {
       'make_zero',
     ]
 
-    if (useVaapi) {
-      // init_hw_device + filter_hw_device is the explicit, portable VAAPI setup.
-      // -vaapi_device is a shorthand that can fail to propagate to the filtergraph
-      // on some driver versions; this form is unambiguous.
+    // SRT relay provides proper stream framing so VAAPI can establish its hwaccel
+    // decode context. pipe:3 MPEG-TS does not — ffmpeg falls back to h264 (native)
+    // software decode. Other accelerators (CUDA, QSV, VideoToolbox) work fine with
+    // pipe:3 so the relay is VAAPI-specific.
+    const useSrtRelay = isVaapi && this.#cameraRelayPort !== undefined
+
+    if (isVaapi) {
+      // init_hw_device + filter_hw_device: explicit, portable form — -vaapi_device
+      // shorthand does not propagate to filtergraphs on some driver versions.
       ffmpegArgs.push(
-        '-init_hw_device', `vaapi=va:${accelDevice}`,
+        '-init_hw_device', `vaapi=va:${accelDevice || '/dev/dri/renderD128'}`,
         '-filter_hw_device', 'va',
-        '-hwaccel', 'vaapi',
-        '-hwaccel_output_format', 'vaapi',
-        '-hwaccel_device', 'va',
+      )
+      if (useSrtRelay) {
+        // SRT input: VAAPI hw decode can initialise from the network stream.
+        // Frames exit the decoder as vaapi surfaces → scale_vaapi needs no hwupload.
+        ffmpegArgs.push(
+          '-hwaccel', 'vaapi',
+          '-hwaccel_output_format', 'vaapi',
+          '-hwaccel_device', 'va',
+          '-extra_hw_frames', '64',
+        )
+      }
+      // pipe:3 mode: hwaccel decode is intentionally omitted.
+      // With -hwaccel vaapi on a pipe:3 input, ffmpeg cannot establish the VAAPI
+      // decode context from the MPEG-TS headers alone, so it silently falls back to
+      // h264 (native) software decode. Later, when live camera H264 arrives with
+      // richer SPS/PPS, VAAPI decode CAN init — causing the decoder to switch from
+      // h264 (native) to h264_vaapi mid-stream. That triggers a filter-graph
+      // reconfiguration (yuvj420p → vaapi) that scale_vaapi cannot survive:
+      //   "Impossible to convert between formats … auto_scale_0 … src: vaapi"
+      // By omitting -hwaccel here the decoder stays h264 (native) throughout,
+      // the filter graph is stable, and hwupload below handles the CPU→GPU upload.
+    } else if (isCuda) {
+      ffmpegArgs.push(
+        '-hwaccel', 'cuda',
+        '-hwaccel_output_format', 'cuda',
         '-extra_hw_frames', '64',
       )
+      if (accelDevice) ffmpegArgs.push('-hwaccel_device', accelDevice)
+    } else if (isVideoToolbox) {
+      ffmpegArgs.push('-hwaccel', 'videotoolbox')
+    } else if (isQsv) {
+      ffmpegArgs.push('-hwaccel', 'qsv', '-hwaccel_output_format', 'qsv')
+      if (accelDevice) ffmpegArgs.push('-qsv_device', accelDevice)
     }
 
     // Applied regardless of encoder: on severely corrupted/lossy RTP input the
-    // decoder (VAAPI hardware or software libx264) can spin producing rapid
-    // "Invalid data found" errors rather than dropping bad frames and continuing.
-    // ignore_err tells the decoder to absorb errors silently, preventing the
-    // error loop that was observed to delay SIGTERM response. This covers both the
-    // primary VAAPI path and the software fallback NestMTX switches to on a stall.
+    // decoder can spin producing rapid "Invalid data found" errors rather than
+    // dropping bad frames and continuing. ignore_err absorbs these silently.
     ffmpegArgs.push('-err_detect', 'ignore_err')
 
-    ffmpegArgs.push('-i', 'pipe:3')
+    if (useSrtRelay) {
+      ffmpegArgs.push('-i', `srt://127.0.0.1:${this.#cameraRelayPort}`)
+    } else {
+      ffmpegArgs.push('-i', 'pipe:3')
+    }
 
-    if (useVaapi) {
-      // scale_vaapi keeps the frame on the GPU and ensures NV12 format, which
-      // h264_vaapi requires. Replaces format=nv12,hwupload which would download
-      // to CPU then re-upload — that was what caused the swscaler warning.
+    if (isVaapi) {
+      if (useSrtRelay) {
+        // Frames are already VAAPI surfaces from hw decode — no hwupload needed.
+        ffmpegArgs.push('-vf', 'scale_vaapi=format=nv12')
+      } else {
+        // Software-decoded frames are in CPU memory (yuvj420p). hwupload transfers
+        // them to GPU, then scale_vaapi converts to NV12 — the format h264_vaapi
+        // requires. The filter chain stays stable because the decoder never changes.
+        ffmpegArgs.push('-vf', 'hwupload,scale_vaapi=format=nv12')
+      }
       ffmpegArgs.push(
-        '-vf',
-        'scale_vaapi=format=nv12',
         '-c:v',
         'h264_vaapi',
+        '-b:v',
+        '2M',
+        '-maxrate',
+        '2M',
+      )
+    } else if (isCuda) {
+      // CUDA-decoded frames are already in GPU memory (NV12); h264_nvenc accepts
+      // them directly without an intermediate format filter.
+      ffmpegArgs.push(
+        '-c:v',
+        'h264_nvenc',
+        '-preset',
+        'p4',
+        '-b:v',
+        '2M',
+        '-maxrate',
+        '2M',
+      )
+    } else if (isVideoToolbox) {
+      // VideoToolbox: -hwaccel videotoolbox decodes on GPU; h264_videotoolbox
+      // encodes on GPU. No format filter needed — VT surfaces pass through directly.
+      ffmpegArgs.push(
+        '-c:v',
+        'h264_videotoolbox',
+        '-b:v',
+        '2M',
+        '-maxrate',
+        '2M',
+      )
+    } else if (isQsv) {
+      // QSV: decoder output surfaces feed h264_qsv directly on the Intel GPU.
+      ffmpegArgs.push(
+        '-c:v',
+        'h264_qsv',
         '-b:v',
         '2M',
         '-maxrate',
@@ -473,17 +572,12 @@ export default class NestmtxStream extends BaseCommand {
     }
 
     ffmpegArgs.push(
-      // AAC Audio Stream (track 1)
-      '-c:a:0',
-      'aac',
-      '-b:a:0',
-      '128k',
-
-      // Opus Audio Stream (track 2)
-      '-c:a:1',
-      'libopus',
-      '-b:a:1',
-      '128k',
+      // Audio: copy both AAC and Opus tracks produced by upstream ffmpeg (static
+      // or camera). Re-encoding here wastes 4 software codec operations per frame
+      // without changing the codec, format, or bitrate — upstream already encoded
+      // to the required settings.
+      '-c:a',
+      'copy',
 
       '-map',
       '0:v:0',
@@ -502,7 +596,9 @@ export default class NestmtxStream extends BaseCommand {
       `Spawning output streamer: ${ffmpegBinary} ${ffmpegArgs.join(' ')}`
     )
     this.#streamer = execa(ffmpegBinary, ffmpegArgs, {
-      stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
+      // SRT relay mode: output streamer reads from the network, no fd3 needed.
+      // Pipe mode: fd3 carries the MPEG-TS stream from the static/camera Unix socket relay.
+      stdio: useSrtRelay ? 'pipe' : ['pipe', 'pipe', 'pipe', 'pipe'],
       reject: false,
       shell: false,
       signal: this.#abortController.signal,
@@ -612,12 +708,15 @@ export default class NestmtxStream extends BaseCommand {
     // Node.js backs stdio[3] with a net.Socket internally. When the process is
     // killed during a restart the socket emits 'error' (ECONNRESET / EPIPE).
     // Without a listener that becomes an uncaught exception and crashes the process.
-    // @ts-expect-error - stdio[3] is a net.Socket at runtime
-    this.#streamer.stdio[3].on('error', (err: Error) => {
-      if (!this.#outputStreamerIsRestarting) {
-        this.#outputStreamLogger.error(`Output pipe fd3 error: ${err.message}`)
-      }
-    })
+    // In SRT relay mode fd3 doesn't exist, so skip this handler.
+    if (!useSrtRelay) {
+      // @ts-expect-error - stdio[3] is a net.Socket at runtime
+      this.#streamer.stdio[3].on('error', (err: Error) => {
+        if (!this.#outputStreamerIsRestarting) {
+          this.#outputStreamLogger.error(`Output pipe fd3 error: ${err.message}`)
+        }
+      })
+    }
     this.#streamer.on('exit', async (code) => {
       logger.info(`Streamer exited with code ${code}`)
       if (this.#outputStreamerIsRestarting) {
@@ -664,15 +763,15 @@ export default class NestmtxStream extends BaseCommand {
     })
   }
 
-  async #restartOutputStreamer(useVaapi: boolean) {
+  async #restartOutputStreamer(useHwAccel: boolean) {
     // Kill the static placeholder explicitly before touching the output streamer.
     // With shell:false the execa kill now hits ffmpeg directly (no shell orphan),
     // but we still need to wait for the process to actually exit so no lingering
     // data reaches pipe:3 of the new output streamer.
-    // Only done for the VAAPI transition (useVaapi=true); when switching back to
+    // Only done for the HW-accel transition (useHwAccel=true); when switching back to
     // software, #webrtcStart creates a new #staticStreamer concurrently and we
     // must not kill it.
-    if (useVaapi && this.#staticStreamer) {
+    if (useHwAccel && this.#staticStreamer) {
       const ss = this.#staticStreamer
       if (ss.exitCode === null) {
         logger.info(`restartOutputStreamer: killing static streamer (pid ${ss.pid})`)
@@ -702,7 +801,7 @@ export default class NestmtxStream extends BaseCommand {
     }
 
     if (this.#streamer) {
-      logger.info(`restartOutputStreamer: killing output streamer, useVaapi=${useVaapi}`)
+      logger.info(`restartOutputStreamer: killing output streamer, useHwAccel=${useHwAccel}`)
       this.#outputStreamerIsRestarting = true
       await new Promise<void>((resolve) => {
         const streamer = this.#streamer!
@@ -753,8 +852,8 @@ export default class NestmtxStream extends BaseCommand {
       })
       this.#outputStreamerIsRestarting = false
     }
-    logger.info(`restartOutputStreamer: starting new output streamer (useVaapi=${useVaapi})`)
-    this.#startOutputStreamer(useVaapi)
+    logger.info(`restartOutputStreamer: starting new output streamer (useHwAccel=${useHwAccel})`)
+    this.#startOutputStreamer(useHwAccel)
     logger.info(`restartOutputStreamer: new output streamer pid=${this.#streamer?.pid}`)
   }
 
@@ -1077,7 +1176,7 @@ export default class NestmtxStream extends BaseCommand {
 
     this.#connectingStreamAbortController.abort()
     this.#cameraStreamLogger.info(`Starting FFMpeg with RTSP stream`)
-    await this.#restartOutputStreamer(this.#isVaapiEnabled)
+    await this.#restartOutputStreamer(this.#isHwAccelEnabled)
     this.#cameraStreamLogger.info(
       `Spawning RTSP camera ffmpeg: ${ffmpegBinary} ${ffmpegArgs.join(' ')}`
     )
@@ -1178,6 +1277,23 @@ export default class NestmtxStream extends BaseCommand {
     const audioRTCPPort = await pickPort(getPortOptions)
     const videoPort = await pickPort(getPortOptions)
     const videoRTCPPort = await pickPort(getPortOptions)
+
+    // Allocate the local SRT relay port for VAAPI restart-based mode only.
+    // VAAPI requires a real network input to establish the hwaccel decode context;
+    // pipe:3 MPEG-TS does not provide the stream-framing information the VA-API
+    // driver needs. Other accelerators (CUDA, QSV, VideoToolbox) work fine with
+    // pipe:3, so the relay is skipped for them. Single-process mode also skips it
+    // (it keeps the existing Unix socket → pipe:3 path throughout).
+    if (!this.#singleProcessMode && this.#isVaapiEnabled) {
+      this.#cameraRelayPort = await pickPort({
+        type: 'udp',
+        ip: '0.0.0.0',
+        reserveTimeout: 15,
+        minPort: 20001,
+        maxPort: 29999,
+      })
+      this.#cameraStreamLogger.info(`SRT relay: allocated local port ${this.#cameraRelayPort} for camera→output streamer relay`)
+    }
     this.#udpSocket = createSocket('udp4')
 
     const pc = new RTCPeerConnection({
@@ -1502,8 +1618,14 @@ a=rtcp:${audioRTCPPort}
       '-threads',
       '1',
 
-      // Output to Unix socket
-      `unix:${this.#cameraPassthroughSock}`,
+      // Output destination: SRT relay (restart-based mode) or Unix socket (single-process).
+      // In restart-based mode, camera ffmpeg acts as an SRT listener so the VAAPI output
+      // streamer can connect to it as a regular network input, enabling proper hwaccel
+      // decode context setup. In single-process mode the output streamer stays running
+      // and reads from pipe:3, so the Unix socket path is kept unchanged.
+      ...(this.#cameraRelayPort !== undefined
+        ? [`srt://127.0.0.1:${this.#cameraRelayPort}?mode=listener&pkt_size=1316`]
+        : [`unix:${this.#cameraPassthroughSock}`]),
     ]
 
     // Spawn camera ffmpeg BEFORE the output-streamer restart so it opens the
@@ -1511,8 +1633,8 @@ a=rtcp:${audioRTCPPort}
     // the very start of the H264 stream. Waiting until after the restart (~1s)
     // means they're gone and the H264 parser can never find frame boundaries,
     // producing "non-existing PPS referenced" errors for the entire session.
-    // Data written to camera.sock during the restart is dropped by the
-    // #outputStreamerIsRestarting guard, which is correct.
+    // In SRT relay mode, camera ffmpeg starts as the SRT listener; the output
+    // streamer connects to it after the restart completes (~400-800ms later).
     this.#cameraStreamLogger.info(
       `Spawning WebRTC camera ffmpeg: ${ffmpegBinary} ${ffmpegArgs.join(' ')}`
     )
@@ -1576,6 +1698,14 @@ a=rtcp:${audioRTCPPort}
           // Restart-based mode: restart back to software before starting a new
           // placeholder phase (the next #webrtcStart call starts a new static input
           // and will restart to VAAPI again when the camera reconnects).
+          if (this.#cameraRelayPort !== undefined) {
+            // During the SRT relay camera phase, packets don't flow through Node,
+            // so #lastThirtyPacketCounts has been filling up with zeros. Clear it
+            // now so the stall detector doesn't immediately fire when returning to
+            // the placeholder phase (where packets flow through fd3 again).
+            this.#lastThirtyPacketCounts = []
+            this.#stalled = false
+          }
           void this.#restartOutputStreamer(false)
         } else {
           // Single-process mode: output streamer stays in VAAPI mode throughout.
@@ -1631,7 +1761,7 @@ a=rtcp:${audioRTCPPort}
         )
       }
 
-      await this.#restartOutputStreamer(this.#isVaapiEnabled)
+      await this.#restartOutputStreamer(this.#isHwAccelEnabled)
 
       if (this.#videoReceiver !== undefined && this.#videoSsrc !== undefined) {
         this.#cameraStreamLogger.info(
