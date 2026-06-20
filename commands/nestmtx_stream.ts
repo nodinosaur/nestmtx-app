@@ -198,6 +198,14 @@ export default class NestmtxStream extends BaseCommand {
     )
   }
 
+  // When true: skip the static "Connecting" placeholder entirely. The output
+  // streamer is not started until the camera WebRTC/RTSP connection is live.
+  // Viewers see buffering in their player instead of the placeholder image, then
+  // get live video with no session drop (no publisher restart = no RTSP teardown).
+  get #skipPlaceholder() {
+    return String(env.get('NESTMTX_SKIP_PLACEHOLDER', 'false')) === 'true'
+  }
+
   async run() {
     process.once('SIGINT', this.#gracefulExit.bind(this))
     logger.info(`NestMTX Streamer for "${this.path}". PID: ${process.pid}`)
@@ -233,13 +241,17 @@ export default class NestmtxStream extends BaseCommand {
     this.#cameraSocket.on('error', (error) => {
       logger.error(`Error from Camera Unix Socket: ${error.message}`)
     })
-    logger.info(`Starting output streamer`)
-    if (this.#singleProcessMode) {
-      logger.info(`VAAPI_SINGLE_PROCESS mode: enabled — starting output streamer in VAAPI mode from the beginning`)
+    if (this.#skipPlaceholder) {
+      logger.info(`NESTMTX_SKIP_PLACEHOLDER: enabled — output streamer deferred until camera connects`)
     } else {
-      logger.info(`VAAPI_SINGLE_PROCESS mode: disabled — using restart-based VAAPI switch`)
+      logger.info(`Starting output streamer`)
+      if (this.#singleProcessMode) {
+        logger.info(`VAAPI_SINGLE_PROCESS mode: enabled — starting output streamer in VAAPI mode from the beginning`)
+      } else {
+        logger.info(`VAAPI_SINGLE_PROCESS mode: disabled — using restart-based VAAPI switch`)
+      }
+      this.#startOutputStreamer(this.#singleProcessMode)
     }
-    this.#startOutputStreamer(this.#singleProcessMode)
     const privateApiServerUrl = `http://127.0.0.1:${this.port}`
     logger.info(`Searching for Private API Server`)
     await new Promise<void>((resolve) => {
@@ -315,6 +327,7 @@ export default class NestmtxStream extends BaseCommand {
       }
     }, 1000)
     if (!camera) {
+      if (!this.#streamer) this.#startOutputStreamer(false)
       logger.info(`Camera not found`)
       this.#connectingStreamAbortController.abort()
       this.#streamJpegToOutputStream(this.#noSuchCameraFilePath)
@@ -323,6 +336,7 @@ export default class NestmtxStream extends BaseCommand {
       !camera.protocols ||
       (!camera.protocols.includes('WEB_RTC') && !camera.protocols.includes('RTSP'))
     ) {
+      if (!this.#streamer) this.#startOutputStreamer(false)
       logger.info(`Camera disabled`)
       this.#connectingStreamAbortController.abort()
       this.#streamJpegToOutputStream(this.#cameraDisabledFilePath)
@@ -413,6 +427,30 @@ export default class NestmtxStream extends BaseCommand {
     socket.on('close', () => logger.info(`camera.sock: client disconnected (close)`))
     socket.on('error', (error) => {
       logger.error(`camera.sock client error: ${error.message}`)
+    })
+  }
+
+  // Kill the running output streamer and wait for it to exit, without starting
+  // a replacement. Used in skip-placeholder mode when the camera session ends:
+  // the output streamer's SRT relay is gone, so we kill it cleanly before the
+  // next #webrtcStart allocates a fresh relay port and starts a new one.
+  async #killOutputStreamer(): Promise<void> {
+    if (!this.#streamer || this.#streamer.exitCode !== null) return
+    return new Promise<void>((resolve) => {
+      const streamer = this.#streamer!
+      this.#outputStreamerIsRestarting = true
+      const sigkill = setTimeout(() => streamer.kill('SIGKILL'), 1500)
+      const fallback = setTimeout(() => {
+        this.#outputStreamerIsRestarting = false
+        resolve()
+      }, 3000)
+      streamer.once('exit', () => {
+        clearTimeout(sigkill)
+        clearTimeout(fallback)
+        this.#outputStreamerIsRestarting = false
+        resolve()
+      })
+      streamer.kill('SIGTERM')
     })
   }
 
@@ -1176,7 +1214,11 @@ export default class NestmtxStream extends BaseCommand {
 
     this.#connectingStreamAbortController.abort()
     this.#cameraStreamLogger.info(`Starting FFMpeg with RTSP stream`)
-    await this.#restartOutputStreamer(this.#isHwAccelEnabled)
+    if (this.#skipPlaceholder) {
+      this.#startOutputStreamer(this.#isHwAccelEnabled)
+    } else {
+      await this.#restartOutputStreamer(this.#isHwAccelEnabled)
+    }
     this.#cameraStreamLogger.info(
       `Spawning RTSP camera ffmpeg: ${ffmpegBinary} ${ffmpegArgs.join(' ')}`
     )
@@ -1204,13 +1246,17 @@ export default class NestmtxStream extends BaseCommand {
         }
         this.#gracefulExit(code || 0)
       } else {
-        this.#connectingStreamAbortController = new AbortController()
-        void this.#streamJpegToOutputStream(
-          this.#connectingFilePath,
-          camera.resolution || '640x480',
-          this.#connectingStreamAbortController.signal
-        )
-        void this.#restartOutputStreamer(false)
+        if (!this.#skipPlaceholder) {
+          this.#connectingStreamAbortController = new AbortController()
+          void this.#streamJpegToOutputStream(
+            this.#connectingFilePath,
+            camera.resolution || '640x480',
+            this.#connectingStreamAbortController.signal
+          )
+          void this.#restartOutputStreamer(false)
+        } else {
+          await this.#killOutputStreamer()
+        }
         void this.#rtspStart(service, camera, 0)
       }
     })
@@ -1254,16 +1300,18 @@ export default class NestmtxStream extends BaseCommand {
     this.#cameraStreamLogger.info(
       `webrtcStart: starting placeholder — size=${placeholderSize} profile=${placeholderProfile ?? 'baseline(default)'} colorspace=${placeholderColorspace ?? 'undetected'} fps=${placeholderFrameRate ?? '2(default)'} refs=${placeholderRefs ?? 'undetected'} level=${placeholderLevel ?? 'undetected'} (reason: ${this.#singleProcessMode && this.#detectedCameraSize ? 'matched detected camera format' : this.#singleProcessMode ? 'single-process mode but no detection yet' : 'restart-based mode or mode disabled'})`
     )
-    this.#streamJpegToOutputStream(
-      this.#connectingFilePath,
-      placeholderSize,
-      this.#connectingStreamAbortController.signal,
-      placeholderProfile,
-      placeholderColorspace,
-      placeholderFrameRate,
-      placeholderRefs,
-      placeholderLevel,
-    )
+    if (!this.#skipPlaceholder) {
+      this.#streamJpegToOutputStream(
+        this.#connectingFilePath,
+        placeholderSize,
+        this.#connectingStreamAbortController.signal,
+        placeholderProfile,
+        placeholderColorspace,
+        placeholderFrameRate,
+        placeholderRefs,
+        placeholderLevel,
+      )
+    }
 
     const getPortOptions: PickPortOptions = {
       type: 'udp',
@@ -1695,18 +1743,28 @@ a=rtcp:${audioRTCPPort}
       } else {
         // Expected exit (code 0, 8, or SIGABRT from a deliberate kill).
         if (!this.#singleProcessMode) {
-          // Restart-based mode: restart back to software before starting a new
-          // placeholder phase (the next #webrtcStart call starts a new static input
-          // and will restart to VAAPI again when the camera reconnects).
-          if (this.#cameraRelayPort !== undefined) {
-            // During the SRT relay camera phase, packets don't flow through Node,
-            // so #lastThirtyPacketCounts has been filling up with zeros. Clear it
-            // now so the stall detector doesn't immediately fire when returning to
-            // the placeholder phase (where packets flow through fd3 again).
+          if (this.#skipPlaceholder) {
+            // Skip-placeholder mode: no placeholder to revert to. Kill the output
+            // streamer (its SRT relay source is gone) and clear the relay port so
+            // the next #webrtcStart allocates a fresh one.
             this.#lastThirtyPacketCounts = []
             this.#stalled = false
+            this.#cameraRelayPort = undefined
+            await this.#killOutputStreamer()
+          } else {
+            // Restart-based mode: restart back to software before starting a new
+            // placeholder phase (the next #webrtcStart call starts a new static input
+            // and will restart to VAAPI again when the camera reconnects).
+            if (this.#cameraRelayPort !== undefined) {
+              // During the SRT relay camera phase, packets don't flow through Node,
+              // so #lastThirtyPacketCounts has been filling up with zeros. Clear it
+              // now so the stall detector doesn't immediately fire when returning to
+              // the placeholder phase (where packets flow through fd3 again).
+              this.#lastThirtyPacketCounts = []
+              this.#stalled = false
+            }
+            void this.#restartOutputStreamer(false)
           }
-          void this.#restartOutputStreamer(false)
         } else {
           // Single-process mode: output streamer stays in VAAPI mode throughout.
           // The new static input will be fed as H264 to the same running VAAPI
@@ -1743,39 +1801,57 @@ a=rtcp:${audioRTCPPort}
     }, 2000)
 
     if (!this.#singleProcessMode) {
-      // Restart-based mode (default): kill the software output streamer and
-      // spawn a new VAAPI one. Two PLIs bridge the ~400ms kill/respawn gap —
-      // the early one puts the camera's keyframe round-trip in flight while the
-      // restart runs; the post-restart one ensures the new output streamer gets
-      // a clean IDR once it's ready to receive data.
-      if (this.#videoReceiver !== undefined && this.#videoSsrc !== undefined) {
-        this.#cameraStreamLogger.info(
-          `Sending early PLI before restart (video SSRC=${this.#videoSsrc})`
-        )
-        this.#videoReceiver.sendRtcpPLI(this.#videoSsrc).catch((err: any) => {
-          this.#cameraStreamLogger.warning(`Early PLI send failed: ${err.message}`)
-        })
-      } else {
-        this.#cameraStreamLogger.warning(
-          `Early PLI skipped: videoReceiver=${this.#videoReceiver !== undefined}, videoSsrc=${this.#videoSsrc}`
-        )
-      }
-
-      await this.#restartOutputStreamer(this.#isHwAccelEnabled)
-
-      if (this.#videoReceiver !== undefined && this.#videoSsrc !== undefined) {
-        this.#cameraStreamLogger.info(
-          `Sending post-restart PLI (video SSRC=${this.#videoSsrc})`
-        )
-        try {
-          await this.#videoReceiver.sendRtcpPLI(this.#videoSsrc)
-        } catch (err: any) {
-          this.#cameraStreamLogger.warning(`Post-restart PLI send failed: ${err.message}`)
+      if (this.#skipPlaceholder) {
+        // No placeholder output streamer to kill — start the hw-accel streamer
+        // directly. No two-PLI sequence needed: camera ffmpeg is already open
+        // and the output streamer will connect to the SRT relay immediately.
+        this.#cameraStreamLogger.info(`skip-placeholder: starting output streamer directly in hw-accel mode`)
+        this.#startOutputStreamer(this.#isHwAccelEnabled)
+        if (this.#videoReceiver !== undefined && this.#videoSsrc !== undefined) {
+          this.#cameraStreamLogger.info(
+            `Sending PLI for keyframe (skip-placeholder, video SSRC=${this.#videoSsrc})`
+          )
+          try {
+            await this.#videoReceiver.sendRtcpPLI(this.#videoSsrc)
+          } catch (err: any) {
+            this.#cameraStreamLogger.warning(`PLI send failed: ${err.message}`)
+          }
         }
       } else {
-        this.#cameraStreamLogger.warning(
-          `Post-restart PLI skipped: videoReceiver=${this.#videoReceiver !== undefined}, videoSsrc=${this.#videoSsrc}`
-        )
+        // Restart-based mode (default): kill the software output streamer and
+        // spawn a new VAAPI one. Two PLIs bridge the ~400ms kill/respawn gap —
+        // the early one puts the camera's keyframe round-trip in flight while the
+        // restart runs; the post-restart one ensures the new output streamer gets
+        // a clean IDR once it's ready to receive data.
+        if (this.#videoReceiver !== undefined && this.#videoSsrc !== undefined) {
+          this.#cameraStreamLogger.info(
+            `Sending early PLI before restart (video SSRC=${this.#videoSsrc})`
+          )
+          this.#videoReceiver.sendRtcpPLI(this.#videoSsrc).catch((err: any) => {
+            this.#cameraStreamLogger.warning(`Early PLI send failed: ${err.message}`)
+          })
+        } else {
+          this.#cameraStreamLogger.warning(
+            `Early PLI skipped: videoReceiver=${this.#videoReceiver !== undefined}, videoSsrc=${this.#videoSsrc}`
+          )
+        }
+
+        await this.#restartOutputStreamer(this.#isHwAccelEnabled)
+
+        if (this.#videoReceiver !== undefined && this.#videoSsrc !== undefined) {
+          this.#cameraStreamLogger.info(
+            `Sending post-restart PLI (video SSRC=${this.#videoSsrc})`
+          )
+          try {
+            await this.#videoReceiver.sendRtcpPLI(this.#videoSsrc)
+          } catch (err: any) {
+            this.#cameraStreamLogger.warning(`Post-restart PLI send failed: ${err.message}`)
+          }
+        } else {
+          this.#cameraStreamLogger.warning(
+            `Post-restart PLI skipped: videoReceiver=${this.#videoReceiver !== undefined}, videoSsrc=${this.#videoSsrc}`
+          )
+        }
       }
     } else {
       // Single-process investigation mode: output streamer is already running in
