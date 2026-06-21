@@ -198,6 +198,16 @@ export default class NestmtxStream extends BaseCommand {
     )
   }
 
+  // When enabled, the output streamer starts once and never restarts.
+  // It reads from pipe:3 in -c:v copy mode — no decode/encode, no filter chain.
+  // The placeholder and camera ffmpeg write to the same Unix socket relay
+  // sequentially; NestMTX holds the write end open so the output streamer
+  // never sees EOF during the switch. MediaMTX always has a publisher, so
+  // VLC (or any RTSP client) never gets its session dropped.
+  get #persistentMode() {
+    return String(env.get('NESTMTX_PERSISTENT_STREAMER', 'false')) === 'true'
+  }
+
   async run() {
     process.once('SIGINT', this.#gracefulExit.bind(this))
     logger.info(`NestMTX Streamer for "${this.path}". PID: ${process.pid}`)
@@ -234,7 +244,9 @@ export default class NestmtxStream extends BaseCommand {
       logger.error(`Error from Camera Unix Socket: ${error.message}`)
     })
     logger.info(`Starting output streamer`)
-    if (this.#singleProcessMode) {
+    if (this.#persistentMode) {
+      logger.info(`NESTMTX_PERSISTENT_STREAMER: enabled — output streamer will run in copy mode and never restart`)
+    } else if (this.#singleProcessMode) {
       logger.info(`VAAPI_SINGLE_PROCESS mode: enabled — starting output streamer in VAAPI mode from the beginning`)
     } else {
       logger.info(`VAAPI_SINGLE_PROCESS mode: disabled — using restart-based VAAPI switch`)
@@ -449,46 +461,51 @@ export default class NestmtxStream extends BaseCommand {
     // software decode. Other accelerators (CUDA, QSV, VideoToolbox) work fine with
     // pipe:3 so the relay is VAAPI-specific.
     const useSrtRelay = isVaapi && this.#cameraRelayPort !== undefined
+    // Persistent mode: bypass all hwaccel; just copy h264 bytes through pipe:3
+    // unchanged. No filter chain → no reinit errors when source switches.
+    const useCopyMode = this.#persistentMode
 
-    if (isVaapi) {
-      // init_hw_device + filter_hw_device: explicit, portable form — -vaapi_device
-      // shorthand does not propagate to filtergraphs on some driver versions.
-      ffmpegArgs.push(
-        '-init_hw_device', `vaapi=va:${accelDevice || '/dev/dri/renderD128'}`,
-        '-filter_hw_device', 'va',
-      )
-      if (useSrtRelay) {
-        // SRT input: VAAPI hw decode can initialise from the network stream.
-        // Frames exit the decoder as vaapi surfaces → scale_vaapi needs no hwupload.
+    if (!useCopyMode) {
+      if (isVaapi) {
+        // init_hw_device + filter_hw_device: explicit, portable form — -vaapi_device
+        // shorthand does not propagate to filtergraphs on some driver versions.
         ffmpegArgs.push(
-          '-hwaccel', 'vaapi',
-          '-hwaccel_output_format', 'vaapi',
-          '-hwaccel_device', 'va',
+          '-init_hw_device', `vaapi=va:${accelDevice || '/dev/dri/renderD128'}`,
+          '-filter_hw_device', 'va',
+        )
+        if (useSrtRelay) {
+          // SRT input: VAAPI hw decode can initialise from the network stream.
+          // Frames exit the decoder as vaapi surfaces → scale_vaapi needs no hwupload.
+          ffmpegArgs.push(
+            '-hwaccel', 'vaapi',
+            '-hwaccel_output_format', 'vaapi',
+            '-hwaccel_device', 'va',
+            '-extra_hw_frames', '64',
+          )
+        }
+        // pipe:3 mode: hwaccel decode is intentionally omitted.
+        // With -hwaccel vaapi on a pipe:3 input, ffmpeg cannot establish the VAAPI
+        // decode context from the MPEG-TS headers alone, so it silently falls back to
+        // h264 (native) software decode. Later, when live camera H264 arrives with
+        // richer SPS/PPS, VAAPI decode CAN init — causing the decoder to switch from
+        // h264 (native) to h264_vaapi mid-stream. That triggers a filter-graph
+        // reconfiguration (yuvj420p → vaapi) that scale_vaapi cannot survive:
+        //   "Impossible to convert between formats … auto_scale_0 … src: vaapi"
+        // By omitting -hwaccel here the decoder stays h264 (native) throughout,
+        // the filter graph is stable, and hwupload below handles the CPU→GPU upload.
+      } else if (isCuda) {
+        ffmpegArgs.push(
+          '-hwaccel', 'cuda',
+          '-hwaccel_output_format', 'cuda',
           '-extra_hw_frames', '64',
         )
+        if (accelDevice) ffmpegArgs.push('-hwaccel_device', accelDevice)
+      } else if (isVideoToolbox) {
+        ffmpegArgs.push('-hwaccel', 'videotoolbox')
+      } else if (isQsv) {
+        ffmpegArgs.push('-hwaccel', 'qsv', '-hwaccel_output_format', 'qsv')
+        if (accelDevice) ffmpegArgs.push('-qsv_device', accelDevice)
       }
-      // pipe:3 mode: hwaccel decode is intentionally omitted.
-      // With -hwaccel vaapi on a pipe:3 input, ffmpeg cannot establish the VAAPI
-      // decode context from the MPEG-TS headers alone, so it silently falls back to
-      // h264 (native) software decode. Later, when live camera H264 arrives with
-      // richer SPS/PPS, VAAPI decode CAN init — causing the decoder to switch from
-      // h264 (native) to h264_vaapi mid-stream. That triggers a filter-graph
-      // reconfiguration (yuvj420p → vaapi) that scale_vaapi cannot survive:
-      //   "Impossible to convert between formats … auto_scale_0 … src: vaapi"
-      // By omitting -hwaccel here the decoder stays h264 (native) throughout,
-      // the filter graph is stable, and hwupload below handles the CPU→GPU upload.
-    } else if (isCuda) {
-      ffmpegArgs.push(
-        '-hwaccel', 'cuda',
-        '-hwaccel_output_format', 'cuda',
-        '-extra_hw_frames', '64',
-      )
-      if (accelDevice) ffmpegArgs.push('-hwaccel_device', accelDevice)
-    } else if (isVideoToolbox) {
-      ffmpegArgs.push('-hwaccel', 'videotoolbox')
-    } else if (isQsv) {
-      ffmpegArgs.push('-hwaccel', 'qsv', '-hwaccel_output_format', 'qsv')
-      if (accelDevice) ffmpegArgs.push('-qsv_device', accelDevice)
     }
 
     // Applied regardless of encoder: on severely corrupted/lossy RTP input the
@@ -502,7 +519,12 @@ export default class NestmtxStream extends BaseCommand {
       ffmpegArgs.push('-i', 'pipe:3')
     }
 
-    if (isVaapi) {
+    if (useCopyMode) {
+      // Persistent mode: pass h264 bytes through unchanged — no decode, no encode,
+      // no filter chain. The output streamer never needs to restart because there
+      // is nothing to reinitialise when the source switches from placeholder to camera.
+      ffmpegArgs.push('-c:v', 'copy')
+    } else if (isVaapi) {
       if (useSrtRelay) {
         // Frames are already VAAPI surfaces from hw decode — no hwupload needed.
         ffmpegArgs.push('-vf', 'scale_vaapi=format=nv12')
@@ -1176,7 +1198,9 @@ export default class NestmtxStream extends BaseCommand {
 
     this.#connectingStreamAbortController.abort()
     this.#cameraStreamLogger.info(`Starting FFMpeg with RTSP stream`)
-    await this.#restartOutputStreamer(this.#isHwAccelEnabled)
+    if (!this.#persistentMode) {
+      await this.#restartOutputStreamer(this.#isHwAccelEnabled)
+    }
     this.#cameraStreamLogger.info(
       `Spawning RTSP camera ffmpeg: ${ffmpegBinary} ${ffmpegArgs.join(' ')}`
     )
@@ -1210,7 +1234,9 @@ export default class NestmtxStream extends BaseCommand {
           camera.resolution || '640x480',
           this.#connectingStreamAbortController.signal
         )
-        void this.#restartOutputStreamer(false)
+        if (!this.#persistentMode) {
+          void this.#restartOutputStreamer(false)
+        }
         void this.#rtspStart(service, camera, 0)
       }
     })
@@ -1284,7 +1310,7 @@ export default class NestmtxStream extends BaseCommand {
     // driver needs. Other accelerators (CUDA, QSV, VideoToolbox) work fine with
     // pipe:3, so the relay is skipped for them. Single-process mode also skips it
     // (it keeps the existing Unix socket → pipe:3 path throughout).
-    if (!this.#singleProcessMode && this.#isVaapiEnabled) {
+    if (!this.#singleProcessMode && !this.#persistentMode && this.#isVaapiEnabled) {
       this.#cameraRelayPort = await pickPort({
         type: 'udp',
         ip: '0.0.0.0',
@@ -1534,7 +1560,18 @@ a=rtcp:${audioRTCPPort}
 
     await writeFile(this.#streamerFFMpegInputSdp, sdp)
     this.#connectingStreamAbortController.abort()
-    if (this.#singleProcessMode) {
+    if (this.#persistentMode) {
+      // Wait for the placeholder to fully exit before camera ffmpeg starts writing
+      // to camera.sock. Without this, both could briefly write to pipe:3 simultaneously,
+      // producing interleaved h264 that the output streamer (copy mode) cannot parse.
+      if (this.#staticStreamer && this.#staticStreamer.exitCode === null) {
+        const ss = this.#staticStreamer
+        await new Promise<void>((resolve) => {
+          const timeout = setTimeout(() => resolve(), 1500)
+          ss.once('exit', () => { clearTimeout(timeout); resolve() })
+        })
+      }
+    } else if (this.#singleProcessMode) {
       this.#singleProcessCameraActive = true
       this.#detectedCameraForCurrentCycleAt = 0
     }
@@ -1657,7 +1694,15 @@ a=rtcp:${audioRTCPPort}
     this.#cameraStreamer.on('exit', async (code, es?: NodeJS.Signals) => {
       this.#cameraStreamLogger.info(`WebRTC Camera FFMpeg exited with code ${code}`)
       const isUnexpected = code !== 0 && code !== 8 && es !== 'SIGABRT'
-      if (isUnexpected && this.#singleProcessMode) {
+      if (isUnexpected && this.#persistentMode) {
+        // Persistent mode: unexpected camera crash — restart the output streamer
+        // in copy mode (to unfreeze pipe:3) and re-enter the placeholder→camera cycle.
+        this.#cameraStreamLogger.warning(
+          `persistent mode: camera crashed unexpectedly (code=${code}) — restarting output streamer and reconnecting`
+        )
+        await this.#restartOutputStreamer(false)
+        void this.#webrtcStart(service, camera)
+      } else if (isUnexpected && this.#singleProcessMode) {
         // Unexpected crash in single-process mode — recover in-place rather than
         // tearing down the whole process. A camera crash (bitstream corruption,
         // exit code 183, etc.) leaves the VAAPI output streamer frozen: it's still
@@ -1694,7 +1739,14 @@ a=rtcp:${audioRTCPPort}
         this.#gracefulExit(code || 0)
       } else {
         // Expected exit (code 0, 8, or SIGABRT from a deliberate kill).
-        if (!this.#singleProcessMode) {
+        if (this.#persistentMode) {
+          // Persistent mode: output streamer stays in copy mode throughout.
+          // The next #webrtcStart will restart the placeholder, which writes to
+          // streamer.sock → pipe:3. The output streamer keeps running uninterrupted.
+          this.#cameraStreamLogger.info(
+            `persistent mode: camera exited, output streamer pid=${this.#streamer?.pid} stays running`
+          )
+        } else if (!this.#singleProcessMode) {
           // Restart-based mode: restart back to software before starting a new
           // placeholder phase (the next #webrtcStart call starts a new static input
           // and will restart to VAAPI again when the camera reconnects).
@@ -1742,7 +1794,21 @@ a=rtcp:${audioRTCPPort}
       )
     }, 2000)
 
-    if (!this.#singleProcessMode) {
+    if (this.#persistentMode) {
+      // Persistent mode: output streamer stays in copy mode — no restart needed.
+      // Just send a PLI so the camera delivers a fresh IDR for the new data that
+      // will flow into pipe:3 now that the placeholder has stopped writing.
+      this.#cameraStreamLogger.info(
+        `persistent mode: skipping restart, output streamer pid=${this.#streamer?.pid} stays running`
+      )
+      if (this.#videoReceiver !== undefined && this.#videoSsrc !== undefined) {
+        try {
+          await this.#videoReceiver.sendRtcpPLI(this.#videoSsrc)
+        } catch (err: any) {
+          this.#cameraStreamLogger.warning(`Persistent PLI send failed: ${err.message}`)
+        }
+      }
+    } else if (!this.#singleProcessMode) {
       // Restart-based mode (default): kill the software output streamer and
       // spawn a new VAAPI one. Two PLIs bridge the ~400ms kill/respawn gap —
       // the early one puts the camera's keyframe round-trip in flight while the

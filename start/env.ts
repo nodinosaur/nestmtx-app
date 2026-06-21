@@ -120,6 +120,7 @@ export default await Env.create(new URL('../', import.meta.url), {
   FFMPEG_BIN: Env.schema.string.optional(),
   FFMPEG_HW_ACCELERATOR: Env.schema.string.optional(),
   FFMPEG_HW_ACCELERATOR_DEVICE: Env.schema.string.optional(),
+  NESTMTX_PERSISTENT_STREAMER: Env.schema.boolean.optional(),
   FFMPEG_DEBUG_LEVEL: Env.schema.enum.optional([
     'quiet',
     'panic',
