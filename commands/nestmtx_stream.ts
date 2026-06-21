@@ -17,6 +17,7 @@ import {
   getHardwareAcceleratedDecodingArgumentsFor,
   getHardwareAcceleratedEncodingArgumentsFor,
 } from '#utilities/ffmpeg'
+import { buildOutputStreamerArgs, buildCameraFfmpegArgs } from '#utilities/streamer_args'
 import { subProcessLogger as logger } from '#services/logger'
 
 import type { CommandOptions } from '@adonisjs/core/types/ace'
@@ -447,172 +448,18 @@ export default class NestmtxStream extends BaseCommand {
       ? 'info'
       : env.get('FFMPEG_DEBUG_LEVEL', 'warning')
 
-    const ffmpegArgs: string[] = [
-      '-loglevel',
-      logLevel,
-      '-fflags',
-      '+discardcorrupt+genpts',
-      '-avoid_negative_ts',
-      'make_zero',
-    ]
-
-    // SRT relay provides proper stream framing so VAAPI can establish its hwaccel
-    // decode context. pipe:3 MPEG-TS does not — ffmpeg falls back to h264 (native)
-    // software decode. Other accelerators (CUDA, QSV, VideoToolbox) work fine with
-    // pipe:3 so the relay is VAAPI-specific.
     const useSrtRelay = isVaapi && this.#cameraRelayPort !== undefined
-    // Persistent mode: bypass all hwaccel; just copy h264 bytes through pipe:3
-    // unchanged. No filter chain → no reinit errors when source switches.
+
+    const ffmpegArgs = buildOutputStreamerArgs({
+      logLevel,
+      hwAccel,
+      accelDevice,
+      persistentMode: this.#persistentMode,
+      cameraRelayPort: this.#cameraRelayPort,
+      destination: this.#destination,
+    })
+
     const useCopyMode = this.#persistentMode
-
-    if (!useCopyMode) {
-      if (isVaapi) {
-        // init_hw_device + filter_hw_device: explicit, portable form — -vaapi_device
-        // shorthand does not propagate to filtergraphs on some driver versions.
-        ffmpegArgs.push(
-          '-init_hw_device', `vaapi=va:${accelDevice || '/dev/dri/renderD128'}`,
-          '-filter_hw_device', 'va',
-        )
-        if (useSrtRelay) {
-          // SRT input: VAAPI hw decode can initialise from the network stream.
-          // Frames exit the decoder as vaapi surfaces → scale_vaapi needs no hwupload.
-          ffmpegArgs.push(
-            '-hwaccel', 'vaapi',
-            '-hwaccel_output_format', 'vaapi',
-            '-hwaccel_device', 'va',
-            '-extra_hw_frames', '64',
-          )
-        }
-        // pipe:3 mode: hwaccel decode is intentionally omitted.
-        // With -hwaccel vaapi on a pipe:3 input, ffmpeg cannot establish the VAAPI
-        // decode context from the MPEG-TS headers alone, so it silently falls back to
-        // h264 (native) software decode. Later, when live camera H264 arrives with
-        // richer SPS/PPS, VAAPI decode CAN init — causing the decoder to switch from
-        // h264 (native) to h264_vaapi mid-stream. That triggers a filter-graph
-        // reconfiguration (yuvj420p → vaapi) that scale_vaapi cannot survive:
-        //   "Impossible to convert between formats … auto_scale_0 … src: vaapi"
-        // By omitting -hwaccel here the decoder stays h264 (native) throughout,
-        // the filter graph is stable, and hwupload below handles the CPU→GPU upload.
-      } else if (isCuda) {
-        ffmpegArgs.push(
-          '-hwaccel', 'cuda',
-          '-hwaccel_output_format', 'cuda',
-          '-extra_hw_frames', '64',
-        )
-        if (accelDevice) ffmpegArgs.push('-hwaccel_device', accelDevice)
-      } else if (isVideoToolbox) {
-        ffmpegArgs.push('-hwaccel', 'videotoolbox')
-      } else if (isQsv) {
-        ffmpegArgs.push('-hwaccel', 'qsv', '-hwaccel_output_format', 'qsv')
-        if (accelDevice) ffmpegArgs.push('-qsv_device', accelDevice)
-      }
-    }
-
-    // Applied regardless of encoder: on severely corrupted/lossy RTP input the
-    // decoder can spin producing rapid "Invalid data found" errors rather than
-    // dropping bad frames and continuing. ignore_err absorbs these silently.
-    ffmpegArgs.push('-err_detect', 'ignore_err')
-
-    if (useSrtRelay) {
-      ffmpegArgs.push('-i', `srt://127.0.0.1:${this.#cameraRelayPort}`)
-    } else {
-      ffmpegArgs.push('-i', 'pipe:3')
-    }
-
-    if (useCopyMode) {
-      // Persistent mode: pass h264 bytes through unchanged — no decode, no encode,
-      // no filter chain. The output streamer never needs to restart because there
-      // is nothing to reinitialise when the source switches from placeholder to camera.
-      ffmpegArgs.push('-c:v', 'copy')
-    } else if (isVaapi) {
-      if (useSrtRelay) {
-        // Frames are already VAAPI surfaces from hw decode — no hwupload needed.
-        ffmpegArgs.push('-vf', 'scale_vaapi=format=nv12')
-      } else {
-        // Software-decoded frames are in CPU memory (yuvj420p). hwupload transfers
-        // them to GPU, then scale_vaapi converts to NV12 — the format h264_vaapi
-        // requires. The filter chain stays stable because the decoder never changes.
-        ffmpegArgs.push('-vf', 'hwupload,scale_vaapi=format=nv12')
-      }
-      ffmpegArgs.push(
-        '-c:v',
-        'h264_vaapi',
-        '-b:v',
-        '2M',
-        '-maxrate',
-        '2M',
-      )
-    } else if (isCuda) {
-      // CUDA-decoded frames are already in GPU memory (NV12); h264_nvenc accepts
-      // them directly without an intermediate format filter.
-      ffmpegArgs.push(
-        '-c:v',
-        'h264_nvenc',
-        '-preset',
-        'p4',
-        '-b:v',
-        '2M',
-        '-maxrate',
-        '2M',
-      )
-    } else if (isVideoToolbox) {
-      // VideoToolbox: -hwaccel videotoolbox decodes on GPU; h264_videotoolbox
-      // encodes on GPU. No format filter needed — VT surfaces pass through directly.
-      ffmpegArgs.push(
-        '-c:v',
-        'h264_videotoolbox',
-        '-b:v',
-        '2M',
-        '-maxrate',
-        '2M',
-      )
-    } else if (isQsv) {
-      // QSV: decoder output surfaces feed h264_qsv directly on the Intel GPU.
-      ffmpegArgs.push(
-        '-c:v',
-        'h264_qsv',
-        '-b:v',
-        '2M',
-        '-maxrate',
-        '2M',
-      )
-    } else {
-      ffmpegArgs.push(
-        '-c:v',
-        'libx264',
-        '-preset',
-        'veryfast',
-        '-tune',
-        'zerolatency',
-        '-vf',
-        'fps=15',
-        '-b:v',
-        '2M',
-        '-maxrate',
-        '2M'
-      )
-    }
-
-    ffmpegArgs.push(
-      // Audio: copy both AAC and Opus tracks produced by upstream ffmpeg (static
-      // or camera). Re-encoding here wastes 4 software codec operations per frame
-      // without changing the codec, format, or bitrate — upstream already encoded
-      // to the required settings.
-      '-c:a',
-      'copy',
-
-      '-map',
-      '0:v:0',
-      '-map',
-      '0:a:0',
-      '-map',
-      '0:a:1',
-
-      '-f',
-      'mpegts',
-
-      this.#destination,
-    )
 
     this.#outputStreamLogger.info(
       `Spawning output streamer: ${ffmpegBinary} ${ffmpegArgs.join(' ')}`
@@ -1577,102 +1424,21 @@ a=rtcp:${audioRTCPPort}
     }
     this.#cameraStreamLogger.info(`Starting FFMpeg with WebRTC stream`)
 
-    const ffmpegArgs: string[] = [
-      '-y', // Overwrite output files
-      '-hide_banner', // Hide FFmpeg banner
-      '-loglevel',
-      env.get('FFMPEG_DEBUG_LEVEL', 'warning'), // Log level set to warning
-      '-protocol_whitelist',
-      'file,crypto,data,udp,rtp',
-      '-fflags',
-      '+discardcorrupt+nobuffer', // Ignore corrupted frames and minimize buffering
+    // Output destination: SRT relay (restart-based mode) or Unix socket (single-process/persistent).
+    // In restart-based mode, camera ffmpeg acts as an SRT listener so the VAAPI output
+    // streamer can connect to it as a regular network input, enabling proper hwaccel
+    // decode context setup. In single-process/persistent mode the output streamer stays
+    // running and reads from pipe:3, so the Unix socket path is kept unchanged.
+    const cameraOutputPath = this.#cameraRelayPort !== undefined
+      ? `srt://127.0.0.1:${this.#cameraRelayPort}?mode=listener&pkt_size=1316`
+      : `unix:${this.#cameraPassthroughSock}`
 
-      // Limit avformat_find_stream_info to 100ms instead of the default 5 seconds.
-      // The SDP already specifies the codec (H264 video, OPUS audio), so ffmpeg
-      // does not need to wait for actual RTP packets to know the stream layout.
-      // Without this, camera ffmpeg blocks for up to 5s before opening camera.sock,
-      // which is longer than the ~1.3s window before mediamtx's unDemand event
-      // kills the nestmtx:stream process.
-      '-analyzeduration',
-      '100000', // 100ms in microseconds
-
-      // Error tolerance for corrupted H264-in-RTP data. The "h264 bitstream
-      // malformed, no startcode found" failure (exit code 183) originates in
-      // ffmpeg's H264 RTP demuxer: even in copy mode (-c:v copy), the RTP H264
-      // demuxer parses NAL structure to reassemble fragmented units, and it checks
-      // AVFormatContext.error_recognition (set by -err_detect) at that stage.
-      // ignore_err makes that NALU parse step non-fatal. This does NOT cover the
-      // follow-on "Error submitting a packet to the muxer: Invalid data found"
-      // failure — the mpegts muxer has no equivalent tolerance flag — so a
-      // sufficiently corrupted packet can still cause a process exit even with this
-      // flag set. Combined with the existing -fflags +discardcorrupt, this gives
-      // the best available protection short of modifying ffmpeg.
-      '-err_detect',
-      'ignore_err',
-
-      // No hwaccel decoding args here: -c:v copy means the H264 bitstream is
-      // forwarded as-is without decoding. Specifying -hwaccel vaapi alongside
-      // -c:v copy causes ffmpeg to attempt VAAPI device init and then hang
-      // because the device is already held by the VAAPI output streamer.
-
-      // SDP input
-      '-i',
-      this.#streamerFFMpegInputSdp,
-
-      // Pass through video without re-encoding
-      '-c:v',
-      'copy',
-
-      // AAC Audio Stream (track 1)
-      '-c:a:0',
-      'aac',
-      '-b:a:0',
-      '128k', // Audio bitrate for AAC
-
-      // Opus Audio Stream (track 2)
-      '-c:a:1',
-      'libopus',
-      '-b:a:1',
-      '128k', // Audio bitrate for Opus
-
-      // Mapping inputs and outputs
-      '-map',
-      '0:v', // Map the video input to the H.264 video stream
-      '-map',
-      '0:a', // Map the original AAC audio to the first audio track
-      '-map',
-      '0:a', // Map the original audio again for Opus encoding
-
-      // Muxing into MPEG-TS
-      '-f',
-      'mpegts',
-      '-muxdelay',
-      '0.2', // Set muxing delay
-      '-muxpreload',
-      '0.1', // Set mux preload
-
-      // Limit threads before the output URL (trailing options after the URL are ignored)
-      '-threads',
-      '1',
-
-      // Output destination: SRT relay (restart-based mode) or Unix socket (single-process/persistent).
-      // In restart-based mode, camera ffmpeg acts as an SRT listener so the VAAPI output
-      // streamer can connect to it as a regular network input, enabling proper hwaccel
-      // decode context setup. In single-process/persistent mode the output streamer stays
-      // running and reads from pipe:3, so the Unix socket path is kept unchanged.
-      ...(this.#cameraRelayPort !== undefined
-        ? [`srt://127.0.0.1:${this.#cameraRelayPort}?mode=listener&pkt_size=1316`]
-        : [`unix:${this.#cameraPassthroughSock}`]),
-    ]
-
-    // Persistent mode: stamp camera MPEG-TS with wall-clock time so its timestamps
-    // are continuous with the static placeholder (which also uses wall-clock time).
-    // Without this, camera timestamps come from the RTP epoch (a much smaller number),
-    // the DTS jumps backwards when the source switches, and VLC stalls for ~40s as
-    // it buffers to reach the apparent "position" in the stream.
-    if (this.#persistentMode) {
-      ffmpegArgs.splice(ffmpegArgs.indexOf('-i'), 0, '-use_wallclock_as_timestamps', '1')
-    }
+    const ffmpegArgs = buildCameraFfmpegArgs({
+      logLevel: env.get('FFMPEG_DEBUG_LEVEL', 'warning'),
+      sdpPath: this.#streamerFFMpegInputSdp,
+      outputPath: cameraOutputPath,
+      persistentMode: this.#persistentMode,
+    })
 
     // Spawn camera ffmpeg BEFORE the output-streamer restart so it opens the
     // UDP ports immediately. SPS/PPS NAL units are sent by the WebRTC peer at
