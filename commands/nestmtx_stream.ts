@@ -48,6 +48,8 @@ export default class NestmtxStream extends BaseCommand {
   static readonly #RATE_LIMIT_RETRY_MS = 30000
   static readonly #RTSP_CHARACTERISTICS_TIMEOUT_MS = 30000
   static readonly #DIAGNOSTIC_DELAY_MS = 2000
+  static readonly #WEBRTC_CONNECTION_TIMEOUT_MS = 30000
+  static readonly #SSRC_SAMPLE_PACKETS = 10
   // ─────────────────────────────────────────────────────────────────────────────
 
   @args.string({ description: 'The path to start the stream for' })
@@ -324,8 +326,16 @@ export default class NestmtxStream extends BaseCommand {
       // streamer without touching Node, so #packetsToOutputCount stays at zero even
       // when the stream is healthy. Skip the packet-count stall check for this case;
       // camera crashes are already detected by the camera ffmpeg exit handler.
-      const cameraIsActiveInSrtMode =
-        this.#cameraRelayPort !== undefined && this.#cameraStreamer?.exitCode === null
+      // Use process.kill(pid, 0) to verify the process is still alive: exitCode can
+      // lag behind actual process death in rare race conditions, and a dead-but-unkilled
+      // zombie would cause us to skip stall detection indefinitely.
+      let cameraIsActiveInSrtMode = false
+      if (this.#cameraRelayPort !== undefined && this.#cameraStreamer?.exitCode === null) {
+        const pid = this.#cameraStreamer?.pid
+        if (pid) {
+          try { process.kill(pid, 0); cameraIsActiveInSrtMode = true } catch { /* dead */ }
+        }
+      }
       if (
         !this.#stalled &&
         !cameraIsActiveInSrtMode &&
@@ -622,12 +632,21 @@ export default class NestmtxStream extends BaseCommand {
           )
         }
         // Restart with write-gating so camera data doesn't stream into a half-dead pipe.
+        // Gate is released on first stderr from the new process (see #restartOutputStreamer
+        // for the same pattern); timeout fallback in case ffmpeg is silent at startup.
         this.#outputStreamerIsRestarting = true
         this.#startOutputStreamer(true)
-        this.#outputStreamerIsRestarting = false
         logger.info(
           `single-process mode: output streamer restarted (pid=${this.#streamer?.pid}) after reinit failure`
         )
+        const spGateTimeout = setTimeout(
+          () => { this.#outputStreamerIsRestarting = false },
+          NestmtxStream.#PLACEHOLDER_EXIT_WAIT_MS
+        )
+        this.#streamer!.stderr!.once('data', () => {
+          clearTimeout(spGateTimeout)
+          this.#outputStreamerIsRestarting = false
+        })
         // Request a fresh IDR + SPS/PPS so the new output streamer can decode cleanly.
         if (this.#videoReceiver !== undefined && this.#videoSsrc !== undefined) {
           this.#videoReceiver.sendRtcpPLI(this.#videoSsrc).catch(() => {})
@@ -731,11 +750,28 @@ export default class NestmtxStream extends BaseCommand {
           resolve()
         }
       })
-      this.#outputStreamerIsRestarting = false
     }
     logger.info(`restartOutputStreamer: starting new output streamer (useHwAccel=${useHwAccel})`)
     this.#startOutputStreamer(useHwAccel)
     logger.info(`restartOutputStreamer: new output streamer pid=${this.#streamer?.pid}`)
+    // Release the write gate once the new output streamer is actually initialised.
+    // In pipe:3 mode we wait for its first stderr output (ffmpeg banner or first warning)
+    // rather than clearing immediately after spawn — this prevents the Unix socket relay
+    // from writing partial MPEG-TS into pipe:3 before ffmpeg has opened its input buffers.
+    // A timeout fallback ensures the gate is never held forever if ffmpeg is silent at startup.
+    // In SRT relay mode fd3 is absent and writes bypass Node entirely, so the gate is moot.
+    if (this.#streamer?.stdio[3]) {
+      const gateTimeout = setTimeout(
+        () => { this.#outputStreamerIsRestarting = false },
+        NestmtxStream.#PLACEHOLDER_EXIT_WAIT_MS
+      )
+      this.#streamer!.stderr!.once('data', () => {
+        clearTimeout(gateTimeout)
+        this.#outputStreamerIsRestarting = false
+      })
+    } else {
+      this.#outputStreamerIsRestarting = false
+    }
   }
 
   #onFFMpegCameraStreamOutput(data: Buffer, log: winston.Logger) {
@@ -1213,24 +1249,36 @@ export default class NestmtxStream extends BaseCommand {
     const peerConnectedAbortController = new AbortController()
 
     const peerConnected = new Promise<void>((resolve, reject) => {
+      let settled = false
+      let connectionTimeoutId: NodeJS.Timeout
+      const settle = (fn: () => void) => {
+        if (settled) return
+        settled = true
+        clearTimeout(connectionTimeoutId)
+        fn()
+      }
       const onConnectionStateChange = () => {
         switch (pc.connectionState) {
           case 'connected':
             pc.removeEventListener('connectionstatechange', onConnectionStateChange)
-            return resolve(void 0)
+            settle(resolve)
+            break
           case 'disconnected':
           case 'closed':
           case 'failed':
             pc.removeEventListener('connectionstatechange', onConnectionStateChange)
-            return reject(new Error('WebRTC Peer connection failed'))
+            settle(() => reject(new Error('WebRTC Peer connection failed')))
+            break
           default:
             break
         }
       }
       pc.addEventListener('connectionstatechange', onConnectionStateChange)
-      peerConnectedAbortController.signal.addEventListener('abort', () =>
-        // reject(new Error('Aborted'))
-        resolve(void 0)
+      // Graceful shutdown: abort signal resolves cleanly (not an error).
+      peerConnectedAbortController.signal.addEventListener('abort', () => settle(resolve))
+      connectionTimeoutId = setTimeout(
+        () => settle(() => reject(new Error(`WebRTC peer connection timed out after ${NestmtxStream.#WEBRTC_CONNECTION_TIMEOUT_MS}ms`))),
+        NestmtxStream.#WEBRTC_CONNECTION_TIMEOUT_MS
       )
     })
 
@@ -1240,6 +1288,7 @@ export default class NestmtxStream extends BaseCommand {
       })
       .catch((err: Error) => {
         this.#cameraStreamLogger.error(`WebRTC peer connection failed: ${err.message}`)
+        this.#gracefulExit(1)
       })
 
     pc.addEventListener('icecandidateerror', (event) => {
@@ -1290,9 +1339,13 @@ export default class NestmtxStream extends BaseCommand {
       if (event.track.kind === 'video') {
         this.#videoReceiver = event.receiver
       }
+      // Sample SSRC from the first N video packets rather than just the very first.
+      // If the first RTP packet is dropped by the network, this ensures PLI targeting
+      // is populated before the stream stalls waiting for an IDR frame.
+      let videoSsrcSamplesLeft = NestmtxStream.#SSRC_SAMPLE_PACKETS
       const { unSubscribe } = event.track.onReceiveRtp.subscribe((rtp) => {
-        // Capture the video SSRC from the first RTP packet so we can address PLI correctly.
-        if (event.track.kind === 'video' && this.#videoSsrc === undefined) {
+        if (event.track.kind === 'video' && videoSsrcSamplesLeft > 0) {
+          videoSsrcSamplesLeft--
           this.#videoSsrc = rtp.header.ssrc
         }
         switch (event.track.kind) {
