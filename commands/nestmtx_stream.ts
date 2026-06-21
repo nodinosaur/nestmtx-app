@@ -513,17 +513,6 @@ export default class NestmtxStream extends BaseCommand {
     // dropping bad frames and continuing. ignore_err absorbs these silently.
     ffmpegArgs.push('-err_detect', 'ignore_err')
 
-    if (useCopyMode) {
-      // Persistent mode: reassign timestamps to wall-clock time as each packet
-      // arrives. The placeholder and camera ffmpeg produce independent timestamp
-      // timelines (wall-clock vs. RTP epoch). Without this, when camera data
-      // replaces placeholder data the DTS jumps backwards, the MPEG-TS muxer
-      // logs "non monotonous DTS" and silently drops all subsequent frames.
-      // With wall-clock timestamps every packet gets the current time regardless
-      // of which process wrote it, so DTS is always monotonically increasing.
-      ffmpegArgs.push('-use_wallclock_as_timestamps', '1')
-    }
-
     if (useSrtRelay) {
       ffmpegArgs.push('-i', `srt://127.0.0.1:${this.#cameraRelayPort}`)
     } else {
@@ -1666,15 +1655,24 @@ a=rtcp:${audioRTCPPort}
       '-threads',
       '1',
 
-      // Output destination: SRT relay (restart-based mode) or Unix socket (single-process).
+      // Output destination: SRT relay (restart-based mode) or Unix socket (single-process/persistent).
       // In restart-based mode, camera ffmpeg acts as an SRT listener so the VAAPI output
       // streamer can connect to it as a regular network input, enabling proper hwaccel
-      // decode context setup. In single-process mode the output streamer stays running
-      // and reads from pipe:3, so the Unix socket path is kept unchanged.
+      // decode context setup. In single-process/persistent mode the output streamer stays
+      // running and reads from pipe:3, so the Unix socket path is kept unchanged.
       ...(this.#cameraRelayPort !== undefined
         ? [`srt://127.0.0.1:${this.#cameraRelayPort}?mode=listener&pkt_size=1316`]
         : [`unix:${this.#cameraPassthroughSock}`]),
     ]
+
+    // Persistent mode: stamp camera MPEG-TS with wall-clock time so its timestamps
+    // are continuous with the static placeholder (which also uses wall-clock time).
+    // Without this, camera timestamps come from the RTP epoch (a much smaller number),
+    // the DTS jumps backwards when the source switches, and VLC stalls for ~40s as
+    // it buffers to reach the apparent "position" in the stream.
+    if (this.#persistentMode) {
+      ffmpegArgs.splice(ffmpegArgs.indexOf('-i'), 0, '-use_wallclock_as_timestamps', '1')
+    }
 
     // Spawn camera ffmpeg BEFORE the output-streamer restart so it opens the
     // UDP ports immediately. SPS/PPS NAL units are sent by the WebRTC peer at
