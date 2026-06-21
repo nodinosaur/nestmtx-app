@@ -25,7 +25,8 @@ docker pull nestmtx/amd64:latest
 docker run -d \
     --name="nestmtx" \
     --restart=unless-stopped \
-    -e RTP_MAX_PORT="10100" \
+    -e WEBRTC_RTP_MIN_PORT="10000" \
+    -e WEBRTC_RTP_MAX_PORT="10100" \
     -e MEDIA_MTX_RTSP_ENABLED="true" \
     -e MEDIA_MTX_RTMP_ENABLED="true" \
     -e MEDIA_MTX_HLS_ENABLED="true" \
@@ -51,7 +52,8 @@ docker pull nestmtx/arm64:latest
 docker run -d \
     --name="nestmtx" \
     --restart=unless-stopped \
-    -e RTP_MAX_PORT="10100" \
+    -e WEBRTC_RTP_MIN_PORT="10000" \
+    -e WEBRTC_RTP_MAX_PORT="10100" \
     -e MEDIA_MTX_RTSP_ENABLED="true" \
     -e MEDIA_MTX_RTMP_ENABLED="true" \
     -e MEDIA_MTX_HLS_ENABLED="true" \

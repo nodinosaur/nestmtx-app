@@ -30,7 +30,8 @@ services:
     container_name: nestmtx
     restart: unless-stopped
     environment:
-      - RTP_MAX_PORT=10100
+      - WEBRTC_RTP_MIN_PORT=10000
+      - WEBRTC_RTP_MAX_PORT=10100
       - MEDIA_MTX_RTSP_ENABLED=true
       - MEDIA_MTX_RTMP_ENABLED=true
       - MEDIA_MTX_HLS_ENABLED=true
@@ -62,7 +63,8 @@ services:
     container_name: nestmtx
     restart: unless-stopped
     environment:
-      - RTP_MAX_PORT=10100
+      - WEBRTC_RTP_MIN_PORT=10000
+      - WEBRTC_RTP_MAX_PORT=10100
       - MEDIA_MTX_RTSP_ENABLED=true
       - MEDIA_MTX_RTMP_ENABLED=true
       - MEDIA_MTX_HLS_ENABLED=true
@@ -85,11 +87,68 @@ services:
       - /home/user/nestmtx:/home/node/app/tmp
 ```
 
+```yaml [amd64 (Intel VAAPI)]
+version: '3.8'
+
+services:
+  nestmtx:
+    image: nestmtx/amd64:latest
+    container_name: nestmtx
+    restart: unless-stopped
+    environment:
+      - WEBRTC_RTP_MIN_PORT=10000
+      - WEBRTC_RTP_MAX_PORT=10100
+      - MEDIA_MTX_RTSP_ENABLED=true
+      - MEDIA_MTX_RTMP_ENABLED=false
+      - MEDIA_MTX_HLS_ENABLED=false
+      - MEDIA_MTX_WEB_RTC_ENABLED=true
+      - MEDIA_MTX_SRT_ENABLED=false
+      - NESTMTX_RTSP_TCP_PORT=8564
+      - NESTMTX_RTSP_UDP_RTP_PORT=8010
+      - NESTMTX_RTSP_UDP_RTCP_PORT=8011
+      - NESTMTX_WEB_RTC_PORT=8899
+      - NESTMTX_WEB_RTC_UDP_PORT=8199
+      - FFMPEG_HW_ACCELERATOR=vaapi
+      - FFMPEG_HW_ACCELERATOR_DEVICE=/dev/dri/renderD128
+      - NESTMTX_PERSISTENT_STREAMER=true
+    ports:
+      - "2000:2000"
+      - "2001:2001"
+      - "8564:8554"
+      - "8010:8000/udp"
+      - "8011:8001/udp"
+      - "8899:8889"
+      - "8199:8189/tcp"
+      - "8199:8189/udp"
+      - "10000-10100:10000-10100/udp"
+    volumes:
+      - /home/user/nestmtx:/home/node/app/tmp
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128
+    group_add:
+      - "993"
+```
+
 :::warning IMPORTANT NOTE
 
 Make sure you have the folder permissions setup before using this manifest. See [Folder Permissions](#folder-permissions) for more information.
 
 :::
+
+:::info Intel VAAPI (Hardware Acceleration)
+
+The `amd64 (Intel VAAPI)` example enables hardware-accelerated decoding on Intel GPUs via VAAPI and uses `NESTMTX_PERSISTENT_STREAMER=true` to prevent RTSP clients from being dropped when the stream transitions from the placeholder to the live camera feed.
+
+Two extra fields are required:
+
+- **`devices`** — passes the Intel render node (`/dev/dri/renderD128`) into the container. Adjust the path if your GPU uses a different node.
+- **`group_add`** — adds the container's `node` user to the host's `render` group so ffmpeg can open the device. The value `993` is the render group GID on many Linux distributions; check yours with `getent group render | cut -d: -f3` and update accordingly.
+
+The `NESTMTX_WEB_RTC_UDP_PORT` variable tells the UI which external port to advertise for WebRTC UDP — set it to match the host side of the `8189` mapping.
+
+:::
+
+
 
 ### Bringing Up the Services
 
@@ -278,15 +337,16 @@ By default, NestMTX does not enable any streaming protocols. This is mainly done
 
 You can use the following environmental variables to change the port shown in the UI. This is especially useful when you have mapped a different host port to the protocol's port.
 
-| Environmental Variable       | Default |
-| ---------------------------- | ------- |
-| `NESTMTX_RTSP_TCP_PORT`      | `8554`  |
-| `NESTMTX_RTSP_UDP_RTP_PORT`  | `8000`  |
-| `NESTMTX_RTSP_UDP_RTCP_PORT` | `8001`  |
-| `NESTMTX_RTMP_PORT`          | `1935`  |
-| `NESTMTX_HLS_PORT`           | `8888`  |
-| `NESTMTX_WEB_RTC_PORT`       | `8889`  |
-| `NESTMTX_SRT_PORT`           | `8890`  |
+| Environmental Variable         | Default |
+| ------------------------------ | ------- |
+| `NESTMTX_RTSP_TCP_PORT`        | `8554`  |
+| `NESTMTX_RTSP_UDP_RTP_PORT`    | `8000`  |
+| `NESTMTX_RTSP_UDP_RTCP_PORT`   | `8001`  |
+| `NESTMTX_RTMP_PORT`            | `1935`  |
+| `NESTMTX_HLS_PORT`             | `8888`  |
+| `NESTMTX_WEB_RTC_PORT`         | `8889`  |
+| `NESTMTX_WEB_RTC_UDP_PORT`     | `8189`  |
+| `NESTMTX_SRT_PORT`             | `8890`  |
 
 ### RTSP Output Streaming
 

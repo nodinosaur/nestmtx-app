@@ -1581,7 +1581,7 @@ a=rtcp:${audioRTCPPort}
       '-y', // Overwrite output files
       '-hide_banner', // Hide FFmpeg banner
       '-loglevel',
-      env.get('FFMPEG_LOG_LEVEL', 'warning'), // Log level set to warning
+      env.get('FFMPEG_DEBUG_LEVEL', 'warning'), // Log level set to warning
       '-protocol_whitelist',
       'file,crypto,data,udp,rtp',
       '-fflags',
