@@ -17,7 +17,7 @@ import {
   getHardwareAcceleratedDecodingArgumentsFor,
   getHardwareAcceleratedEncodingArgumentsFor,
 } from '#utilities/ffmpeg'
-import { buildOutputStreamerArgs, buildCameraFfmpegArgs } from '#utilities/streamer_args'
+import { buildOutputStreamerArgs, buildCameraFfmpegArgs, buildRtspCameraFfmpegArgs, getRtspCharacteristicsRetryDelayMs } from '#utilities/streamer_args'
 import { subProcessLogger as logger } from '#services/logger'
 
 import type { CommandOptions } from '@adonisjs/core/types/ace'
@@ -984,91 +984,44 @@ export default class NestmtxStream extends BaseCommand {
   async #rtspStart(
     service: smartdevicemanagement_v1.Smartdevicemanagement,
     camera: Camera,
-    depth: number = 0
   ): Promise<void> {
     const ffmpegBinary = env.get('FFMPEG_BIN', 'ffmpeg')
-    const rtspSrc = await this.#getRtspUrl(service, camera)
-    this.#cameraStreamLogger.info(
-      `Getting RTSP stream characteristics for "${getHostnameFromRtspUrl(rtspSrc)}"`
-    )
-    const getCharacteristicsAbortController = new AbortController()
-    setTimeout(() => {
-      getCharacteristicsAbortController.abort()
-    }, NestmtxStream.#RTSP_CHARACTERISTICS_TIMEOUT_MS)
-    try {
-      await getRtspStreamCharacteristics(
-        rtspSrc,
-        getCharacteristicsAbortController.signal
+
+    // Retry the stream-characteristics check with exponential backoff rather than
+    // terminating after a fixed number of attempts. A camera that's rebooting or
+    // temporarily unreachable would otherwise force a full process restart via PM3
+    // on every occurrence. Backoff caps at 64 s so we don't hammer the Nest API.
+    let rtspSrc: string = ''
+    let attempt = 0
+    while (true) {
+      rtspSrc = await this.#getRtspUrl(service, camera)
+      this.#cameraStreamLogger.info(
+        `Getting RTSP stream characteristics for "${getHostnameFromRtspUrl(rtspSrc)}" (attempt ${attempt + 1})`
       )
-    } catch (error) {
-      this.#cameraStreamLogger.error(error.message)
-      this.#rtspCameraStreamUrl = undefined
-      if (depth > 5) {
-        return this.#gracefulExit(1)
-      } else {
-        return this.#rtspStart(service, camera, depth + 1)
+      const getCharacteristicsAbortController = new AbortController()
+      setTimeout(() => {
+        getCharacteristicsAbortController.abort()
+      }, NestmtxStream.#RTSP_CHARACTERISTICS_TIMEOUT_MS)
+      try {
+        await getRtspStreamCharacteristics(rtspSrc, getCharacteristicsAbortController.signal)
+        break
+      } catch (error) {
+        this.#cameraStreamLogger.error(error.message)
+        this.#rtspCameraStreamUrl = undefined
+        const delay = getRtspCharacteristicsRetryDelayMs(attempt)
+        this.#cameraStreamLogger.warning(
+          `RTSP characteristics failed (attempt ${attempt + 1}), retrying in ${delay / 1000}s`
+        )
+        await new Promise<void>((r) => setTimeout(r, delay))
+        attempt++
       }
     }
-    const ffmpegArgs: string[] = [
-      '-loglevel',
-      env.get('FFMPEG_DEBUG_LEVEL', 'warning'), // Suppress most log messages, only show warnings
-      '-fflags',
-      '+discardcorrupt+nobuffer', // Ignore corrupted frames and minimize buffering
 
-      // Limit avformat_find_stream_info to 100ms. RTSP DESCRIBE already provides codec
-      // info; the 5s default analysis wait causes the same race as the WebRTC case.
-      '-analyzeduration',
-      '100000', // 100ms in microseconds
-
-      // No hwaccel decoding args: same reasoning as the WebRTC camera — -c:v copy
-      // passes the H264 bitstream through without decoding, so VAAPI decoding init
-      // is both unnecessary and conflicting with the VAAPI output streamer.
-
-      // Rate-limit reading to the stream's own timestamps, absorbing CDN burst delivery
-      '-re',
-
-      '-i',
+    const ffmpegArgs = buildRtspCameraFfmpegArgs({
+      logLevel: env.get('FFMPEG_DEBUG_LEVEL', 'warning'),
       rtspSrc,
-
-      // Retry options for network issues
-      '-rtsp_transport',
-      'udp', // Use UDP to reduce latency
-
-      // Pass through video without re-encoding
-      '-c:v',
-      'copy',
-
-      // AAC Audio Stream
-      '-c:a:0',
-      'aac',
-      '-b:a:0',
-      '128k', // Audio bitrate for AAC
-
-      // Opus Audio Stream
-      '-c:a:1',
-      'libopus',
-      '-b:a:1',
-      '128k', // Audio bitrate for Opus
-
-      // Mapping inputs and outputs
-      '-map',
-      '0:v', // Map the video input to the H.264 video stream
-      '-map',
-      '0:a', // Map the original AAC audio to the first audio track
-      '-map',
-      '0:a', // Map the original audio again for Opus encoding
-
-      '-f',
-      'mpegts',
-      '-listen',
-      '0',
-
-      // Limit threads before the output URL (trailing options after the URL are ignored)
-      '-threads',
-      '1',
-
-      `unix:${this.#cameraPassthroughSock}`,
-    ]
+      outputPath: `unix:${this.#cameraPassthroughSock}`,
+    })
 
     this.#connectingStreamAbortController.abort()
     this.#cameraStreamLogger.info(`Starting FFMpeg with RTSP stream`)
@@ -1111,7 +1064,7 @@ export default class NestmtxStream extends BaseCommand {
         if (!this.#persistentMode) {
           void this.#restartOutputStreamer(false)
         }
-        void this.#rtspStart(service, camera, 0)
+        void this.#rtspStart(service, camera)
       }
     })
   }
@@ -1589,17 +1542,23 @@ a=rtcp:${audioRTCPPort}
           // output streamer; the VAAPI decoder sees another SPS transition (live
           // camera → placeholder H264) which is also part of what we're testing.
           this.#singleProcessCameraActive = false
-          // A clean camera exit means this session ran to completion — any prior
-          // in-place recovery was successful. Reset the consecutive-failure counter
-          // so the next cycle gets its full 3 attempts rather than inheriting
-          // failure debt from earlier cycles in the same process lifetime.
-          // Note: #singleProcessFailed is intentionally NOT reset here — once mode
-          // is explicitly disabled for the session it stays disabled.
-          if (this.#singleProcessReinitCount > 0) {
+          // A clean camera exit means this session ran to completion. Reset the
+          // consecutive-failure counter so the next cycle gets its full 3 attempts.
+          const hadFailuresThisSession = this.#singleProcessReinitCount > 0
+          if (hadFailuresThisSession) {
             this.#cameraStreamLogger.info(
               `single-process mode: camera session completed cleanly — resetting reinit count to 0 (was ${this.#singleProcessReinitCount})`
             )
             this.#singleProcessReinitCount = 0
+          }
+          // If the session completed with zero reinit failures, the prior failures
+          // were transient — re-enable single-process mode so the next reconnect
+          // can use VAAPI again rather than staying in software indefinitely.
+          if (this.#singleProcessFailed && !hadFailuresThisSession) {
+            this.#cameraStreamLogger.info(
+              `single-process mode: clean session with no reinit errors — re-enabling for next reconnect`
+            )
+            this.#singleProcessFailed = false
           }
           this.#cameraStreamLogger.info(
             `single-process mode: camera exited, output streamer pid=${this.#streamer?.pid} stays running`

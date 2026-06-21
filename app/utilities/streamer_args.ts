@@ -138,6 +138,43 @@ export function buildOutputStreamerArgs(opts: OutputStreamerArgsOptions): string
   return args
 }
 
+export interface RtspCameraFfmpegArgsOptions {
+  logLevel: string
+  rtspSrc: string
+  outputPath: string
+}
+
+export function buildRtspCameraFfmpegArgs(opts: RtspCameraFfmpegArgsOptions): string[] {
+  const { logLevel, rtspSrc, outputPath } = opts
+  return [
+    '-loglevel', logLevel,
+    '-fflags', '+discardcorrupt+nobuffer',
+    '-analyzeduration', '100000',
+    '-re',
+    '-i', rtspSrc,
+    '-rtsp_transport', 'udp',
+    '-c:v', 'copy',
+    '-c:a:0', 'aac',
+    '-b:a:0', '128k',
+    '-c:a:1', 'libopus',
+    '-b:a:1', '128k',
+    '-map', '0:v',
+    '-map', '0:a',
+    '-map', '0:a',
+    '-f', 'mpegts',
+    '-listen', '0',
+    '-threads', '1',
+    outputPath,
+  ]
+}
+
+// Exponential backoff for RTSP stream-characteristics retries.
+// Caps at 64s so a persistently unavailable camera retries at a reasonable
+// rate without hammering the API every second.
+export function getRtspCharacteristicsRetryDelayMs(attempt: number): number {
+  return Math.min(2 ** Math.min(attempt, 6) * 1000, 64000)
+}
+
 export interface CameraFfmpegArgsOptions {
   logLevel: string
   sdpPath: string
