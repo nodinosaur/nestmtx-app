@@ -38,6 +38,18 @@ export default class NestmtxStream extends BaseCommand {
     startApp: true,
   }
 
+  // ─── Timeouts ────────────────────────────────────────────────────────────────
+  static readonly #STATIC_STREAMER_KILL_MS = 2000
+  static readonly #OUTPUT_STREAMER_SIGKILL_MS = 1500
+  static readonly #OUTPUT_STREAMER_HARD_KILL_MS = 3000
+  static readonly #PLACEHOLDER_EXIT_WAIT_MS = 1500
+  static readonly #VBV_UNDERFLOW_CLEAR_MS = 10000
+  static readonly #VBV_UNDERFLOW_TRIGGER_S = 10
+  static readonly #RATE_LIMIT_RETRY_MS = 30000
+  static readonly #RTSP_CHARACTERISTICS_TIMEOUT_MS = 30000
+  static readonly #DIAGNOSTIC_DELAY_MS = 2000
+  // ─────────────────────────────────────────────────────────────────────────────
+
   @args.string({ description: 'The path to start the stream for' })
   declare path: string
 
@@ -648,7 +660,7 @@ export default class NestmtxStream extends BaseCommand {
           const timeout = setTimeout(() => {
             logger.info(`restartOutputStreamer: static streamer kill timed out`)
             resolve()
-          }, 2000)
+          }, NestmtxStream.#STATIC_STREAMER_KILL_MS)
           ss.once('exit', (code) => {
             clearTimeout(timeout)
             logger.info(`restartOutputStreamer: static streamer exited with code ${code}`)
@@ -684,12 +696,12 @@ export default class NestmtxStream extends BaseCommand {
           if (streamer.exitCode !== null) return
           sigkillSent = true
           logger.info(
-            `restartOutputStreamer: output streamer SIGTERM unresponsive after 1.5s, escalating to SIGKILL (pid ${streamer.pid})`
+            `restartOutputStreamer: output streamer SIGTERM unresponsive after ${NestmtxStream.#OUTPUT_STREAMER_SIGKILL_MS}ms, escalating to SIGKILL (pid ${streamer.pid})`
           )
           try {
             streamer.kill('SIGKILL')
           } catch {}
-        }, 1500)
+        }, NestmtxStream.#OUTPUT_STREAMER_SIGKILL_MS)
 
         // Hard safety valve in case SIGKILL doesn't produce an exit event (zombie).
         const hardTimeout = setTimeout(() => {
@@ -698,7 +710,7 @@ export default class NestmtxStream extends BaseCommand {
             `restartOutputStreamer: output streamer hard kill timeout (pid ${streamer.pid})`
           )
           resolve()
-        }, 3000)
+        }, NestmtxStream.#OUTPUT_STREAMER_HARD_KILL_MS)
 
         streamer.once('exit', (code) => {
           clearTimeout(sigkillTimeout)
@@ -726,8 +738,6 @@ export default class NestmtxStream extends BaseCommand {
     logger.info(`restartOutputStreamer: new output streamer pid=${this.#streamer?.pid}`)
   }
 
-  // ^(.*)\s+VBV\s+underflow\s+\(frame\s+\d+,\s+\-?\d+\s+bits\)$
-
   #onFFMpegCameraStreamOutput(data: Buffer, log: winston.Logger) {
     data
       .toString()
@@ -746,9 +756,9 @@ export default class NestmtxStream extends BaseCommand {
           this.#clearUnderflowWarningInterval = setTimeout(() => {
             this.#firstUnderflowWarningAt = undefined
             this.#lastUnderflowWarningAt = undefined
-          }, 10000)
+          }, NestmtxStream.#VBV_UNDERFLOW_CLEAR_MS)
           const duration = this.#lastUnderflowWarningAt.diff(this.#firstUnderflowWarningAt)
-          if (duration.as('seconds') > 10) {
+          if (duration.as('seconds') > NestmtxStream.#VBV_UNDERFLOW_TRIGGER_S) {
             log.warning('VBV underflow detected for more than 10 seconds. Sending "stall" signal')
             this.#bus.emit('stall')
           }
@@ -775,26 +785,6 @@ export default class NestmtxStream extends BaseCommand {
 
   #streamJpegToOutputStream(src: string, size: string = '640x480', signal?: AbortSignal, profile?: string, colorspace?: string, frameRate?: number, refs?: number, level?: string) {
     const ffmpegBinary = env.get('FFMPEG_BIN', 'ffmpeg')
-
-    // Round 28 isolation test: colorspace flags deliberately NOT applied to the
-    // placeholder ffmpeg command. Detection and storage of #detectedCameraColorspace
-    // are unchanged — the value is still captured and logged from the camera's
-    // stream-info line. Only the application step is removed here.
-    //
-    // Rationale: Round 27 found that matched-format cycles consistently hit exactly
-    // 2 reinit errors (one live→placeholder, one placeholder→camera). Round 25 —
-    // structurally identical — had zero. The only thing that changed between them
-    // was Round 26's colorspace-splitting fix, which introduced explicit
-    // -color_range / -color_primaries / -color_trc / -colorspace flags that were
-    // absent before (previously the colorspace string was mishandled by ffmpeg and
-    // effectively silently ignored). This round tests whether removing those flags
-    // restores the Round 25 result.
-    //
-    // If matched-format cycles come back clean → colorspace flags were the
-    //   regression; resolution+profile+pix_fmt was sufficient all along.
-    // If reinit errors persist → colorspace wasn't the cause; the Round 25 vs 27
-    //   difference lies elsewhere and the pixel-format hypothesis (yuv420p vs
-    //   yuvj420p) becomes the next candidate.
 
     const ffmpegArgs = [
       '-loglevel',
@@ -841,7 +831,8 @@ export default class NestmtxStream extends BaseCommand {
       size,
       '-pix_fmt',
       'yuv420p',
-      // no colorspace flags — Round 28 isolation test, see comment above
+      // colorspace flags intentionally omitted: profile/level are the only SPS
+      // fields the VAAPI decoder's filter chain is sensitive to.
 
       // AAC Audio Stream (track 1)
       '-c:a:0',
@@ -934,8 +925,8 @@ export default class NestmtxStream extends BaseCommand {
         expiresAt = results!.expiresAt
       } catch (error) {
         if ((error as Error).message.includes('Rate limited')) {
-          logger.warning('Rate limited. Waiting 30 seconds before retrying')
-          await new Promise((r) => setTimeout(r, 30000))
+          logger.warning(`Rate limited. Waiting ${NestmtxStream.#RATE_LIMIT_RETRY_MS / 1000}s before retrying`)
+          await new Promise((r) => setTimeout(r, NestmtxStream.#RATE_LIMIT_RETRY_MS))
         } else {
           this.#gracefulExit(1)
         }
@@ -967,7 +958,7 @@ export default class NestmtxStream extends BaseCommand {
     const getCharacteristicsAbortController = new AbortController()
     setTimeout(() => {
       getCharacteristicsAbortController.abort()
-    }, 30000)
+    }, NestmtxStream.#RTSP_CHARACTERISTICS_TIMEOUT_MS)
     try {
       await getRtspStreamCharacteristics(
         rtspSrc,
@@ -1414,7 +1405,12 @@ a=rtcp:${audioRTCPPort}
       if (this.#staticStreamer && this.#staticStreamer.exitCode === null) {
         const ss = this.#staticStreamer
         await new Promise<void>((resolve) => {
-          const timeout = setTimeout(() => resolve(), 1500)
+          const timeout = setTimeout(() => {
+            this.#cameraStreamLogger.warning(
+              `persistent mode: placeholder (pid ${ss.pid}) did not exit within ${NestmtxStream.#PLACEHOLDER_EXIT_WAIT_MS}ms — proceeding anyway; pipe:3 may briefly receive interleaved data`
+            )
+            resolve()
+          }, NestmtxStream.#PLACEHOLDER_EXIT_WAIT_MS)
           ss.once('exit', () => { clearTimeout(timeout); resolve() })
         })
       }
@@ -1565,9 +1561,9 @@ a=rtcp:${audioRTCPPort}
     const diagnosticRef = this.#cameraStreamer
     setTimeout(() => {
       this.#cameraStreamLogger.info(
-        `[diag T+2s] cameraStreamer pid=${diagnosticRef.pid} exitCode=${diagnosticRef.exitCode ?? 'null(running)'} | outputStreamer pid=${this.#streamer?.pid} exitCode=${this.#streamer?.exitCode ?? 'null(running)'}`
+        `[diag T+${NestmtxStream.#DIAGNOSTIC_DELAY_MS}ms] cameraStreamer pid=${diagnosticRef.pid} exitCode=${diagnosticRef.exitCode ?? 'null(running)'} | outputStreamer pid=${this.#streamer?.pid} exitCode=${this.#streamer?.exitCode ?? 'null(running)'}`
       )
-    }, 2000)
+    }, NestmtxStream.#DIAGNOSTIC_DELAY_MS)
 
     if (this.#persistentMode) {
       // Persistent mode: output streamer stays in copy mode — no restart needed.
