@@ -513,6 +513,17 @@ export default class NestmtxStream extends BaseCommand {
     // dropping bad frames and continuing. ignore_err absorbs these silently.
     ffmpegArgs.push('-err_detect', 'ignore_err')
 
+    if (useCopyMode) {
+      // Persistent mode: reassign timestamps to wall-clock time as each packet
+      // arrives. The placeholder and camera ffmpeg produce independent timestamp
+      // timelines (wall-clock vs. RTP epoch). Without this, when camera data
+      // replaces placeholder data the DTS jumps backwards, the MPEG-TS muxer
+      // logs "non monotonous DTS" and silently drops all subsequent frames.
+      // With wall-clock timestamps every packet gets the current time regardless
+      // of which process wrote it, so DTS is always monotonically increasing.
+      ffmpegArgs.push('-use_wallclock_as_timestamps', '1')
+    }
+
     if (useSrtRelay) {
       ffmpegArgs.push('-i', `srt://127.0.0.1:${this.#cameraRelayPort}`)
     } else {
